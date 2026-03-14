@@ -1,0 +1,37 @@
+# Flutter
+.dart_tool/
+.packages
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+*.iml
+
+# Android
+android/.gradle/
+android/app/debug/
+android/app/profile/
+android/app/release/
+**/android/key.properties
+*.jks
+
+# iOS
+ios/Pods/
+ios/.symlinks/
+ios/Flutter/Flutter.framework
+ios/Flutter/Flutter.podspec
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Backend
+backend/node_modules/
+backend/.env
+
+# Misc
+.DS_Store
+*.log
+.agent/
+.gemini/
