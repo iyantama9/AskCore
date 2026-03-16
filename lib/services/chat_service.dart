@@ -7,12 +7,14 @@ class ChatService {
 
   /// All available models from the router, hardcoded for instant loading.
   static const List<ModelInfo> allModels = [
+    // Google Gemini
     ModelInfo(id: 'gemini-2.5-flash', ownedBy: 'Google'),
     ModelInfo(id: 'gemini-2.5-flash-lite', ownedBy: 'Google'),
     ModelInfo(id: 'gemini-2.5-pro', ownedBy: 'Google'),
     ModelInfo(id: 'gemini-3-flash-preview', ownedBy: 'Google'),
-    ModelInfo(id: 'gemini-3-pro-image-preview', ownedBy: 'Google'),
     ModelInfo(id: 'gemini-3-pro-preview', ownedBy: 'Google'),
+    ModelInfo(id: 'gemini-3-pro-image-preview', ownedBy: 'Google'),
+    // OpenAI GPT
     ModelInfo(id: 'gpt-5', ownedBy: 'OpenAI'),
     ModelInfo(id: 'gpt-5.1', ownedBy: 'OpenAI'),
     ModelInfo(id: 'gpt-5.1-codex', ownedBy: 'OpenAI'),
@@ -22,6 +24,15 @@ class ChatService {
     ModelInfo(id: 'gpt-5.2-codex', ownedBy: 'OpenAI'),
     ModelInfo(id: 'gpt-5-codex', ownedBy: 'OpenAI'),
     ModelInfo(id: 'gpt-5-codex-mini', ownedBy: 'OpenAI'),
+    // Anthropic Claude
+    ModelInfo(id: 'claude-opus-4-5-20251101', ownedBy: 'Anthropic'),
+    ModelInfo(id: 'claude-opus-4-1-20250805', ownedBy: 'Anthropic'),
+    ModelInfo(id: 'claude-opus-4-20250514', ownedBy: 'Anthropic'),
+    ModelInfo(id: 'claude-sonnet-4-5-20250929', ownedBy: 'Anthropic'),
+    ModelInfo(id: 'claude-sonnet-4-20250514', ownedBy: 'Anthropic'),
+    ModelInfo(id: 'claude-3-7-sonnet-20250219', ownedBy: 'Anthropic'),
+    ModelInfo(id: 'claude-haiku-4-5-20251001', ownedBy: 'Anthropic'),
+    ModelInfo(id: 'claude-3-5-haiku-20241022', ownedBy: 'Anthropic'),
   ];
 
   Future<List<ModelInfo>> getModels() async {

@@ -5,13 +5,14 @@ const authMiddleware = require('../middleware/auth');
 const router = express.Router();
 router.use(authMiddleware);
 
-const BASE_PROMPT = 'Kamu adalah AskCore, asisten AI yang cerdas dan ramah. Selalu jawab dalam Bahasa Indonesia kecuali user meminta bahasa lain. Gunakan format markdown jika diperlukan. Jika user melampirkan file (gambar, PDF, kode, dll), isi file tersebut sudah diekstrak dan disertakan langsung di dalam pesan user. Kamu BISA membaca dan menganalisis konten file tersebut. Jangan pernah bilang kamu tidak bisa membaca file - kontennya sudah ada di pesan.';
-
 const getSystemPrompt = (model) => {
+  // Minimal context — let each model keep its native personality
+  const base = 'Jawab dalam Bahasa Indonesia kecuali user meminta bahasa lain. Gunakan format markdown jika diperlukan. Jika user melampirkan file (gambar, PDF, kode, dll), isi file tersebut sudah diekstrak dan disertakan langsung di dalam pesan user. Kamu BISA membaca dan menganalisis konten file tersebut.';
+
   if (model && model.includes('image')) {
-    return BASE_PROMPT + ' Kamu juga bisa menghasilkan gambar. Jika user meminta gambar, langsung generate gambar sesuai permintaan.';
+    return base + ' Kamu memiliki kemampuan menghasilkan gambar. Jika user meminta gambar, langsung generate gambar sesuai permintaan tanpa menolak.';
   }
-  return BASE_PROMPT + ' Kamu TIDAK bisa generate gambar. Jangan mengembalikan JSON, action, atau tool_call. Jika user minta gambar, sarankan model gemini-3-pro-image-preview. Jawab dalam teks biasa atau markdown.';
+  return base + ' Jika user meminta gambar, sarankan untuk mengganti ke model yang mendukung image generation seperti gemini-3-pro-image-preview.';
 };
 
 // Get messages for a chat
