@@ -1,13 +1,12 @@
-import 'package:flutter/foundation.dart' show kIsWeb;
 
 class AppConstants {
   AppConstants._();
 
   static const String appName = 'AskCore';
 
-  /// Web uses localhost, mobile uses local IP (same WiFi network)
-  static String get backendUrl =>
-      kIsWeb ? 'http://localhost:4000' : 'http://192.168.100.169:4000';
+  /// Production backend on VPS
+  /// For local dev, change to: 'http://localhost:4000'
+  static const String backendUrl = 'http://143.198.214.130:4000';
 
   static const String defaultModel = 'gemini-2.5-flash-lite';
 
