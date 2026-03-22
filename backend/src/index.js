@@ -8,6 +8,7 @@ const chatRoutes = require('./routes/chats');
 const messageRoutes = require('./routes/messages');
 const uploadRoutes = require('./routes/upload');
 const fileRoutes = require('./routes/files');
+const browseRoutes = require('./routes/browse');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -21,6 +22,7 @@ app.use('/api/chats', chatRoutes);
 app.use('/api/chats', messageRoutes);
 app.use('/api/upload', uploadRoutes);
 app.use('/api/files', fileRoutes);
+app.use('/api/browse', browseRoutes);
 
 // Health check
 app.get('/api/health', (_, res) => res.json({ status: 'ok' }));

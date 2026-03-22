@@ -5,14 +5,175 @@ const authMiddleware = require('../middleware/auth');
 const router = express.Router();
 router.use(authMiddleware);
 
-const getSystemPrompt = (model) => {
-  // Minimal context — let each model keep its native personality
-  const base = 'Jawab dalam Bahasa Indonesia kecuali user meminta bahasa lain. Gunakan format markdown jika diperlukan. Jika user melampirkan file (gambar, PDF, kode, dll), isi file tersebut sudah diekstrak dan disertakan langsung di dalam pesan user. Kamu BISA membaca dan menganalisis konten file tersebut.';
+// --- Browse helpers ---
+function parseBrowseCommands(text) {
+  const commands = [];
+  if (!text) return commands;
+
+  // [BROWSE:url]
+  const browseMatches = text.matchAll(/\[BROWSE:([^\]]+)\]/gi);
+  for (const m of browseMatches) {
+    commands.push({ action: 'navigate', url: m[1].trim() });
+  }
+
+  // [SEARCH:query] → Google search
+  const searchMatches = text.matchAll(/\[SEARCH:([^\]]+)\]/gi);
+  for (const m of searchMatches) {
+    commands.push({ action: 'navigate', url: `https://www.google.com/search?q=${encodeURIComponent(m[1].trim())}` });
+  }
+
+  // [CLICK:selector]
+  const clickMatches = text.matchAll(/\[CLICK:([^\]]+)\]/gi);
+  for (const m of clickMatches) {
+    commands.push({ action: 'click', selector: m[1].trim() });
+  }
+
+  // [TYPE:selector|text]
+  const typeMatches = text.matchAll(/\[TYPE:([^|]+)\|([^\]]+)\]/gi);
+  for (const m of typeMatches) {
+    commands.push({ action: 'type', selector: m[1].trim(), text: m[2].trim() });
+  }
+
+  // [SCROLL:direction]
+  const scrollMatches = text.matchAll(/\[SCROLL:(up|down)\]/gi);
+  for (const m of scrollMatches) {
+    commands.push({ action: 'scroll', scroll_direction: m[1].toLowerCase() });
+  }
+
+  // [ENTER]
+  if (/\[ENTER\]/i.test(text)) {
+    commands.push({ action: 'press_enter' });
+  }
+
+  return commands;
+}
+
+// Execute a single browse command using Puppeteer directly
+let sharedBrowser = null;
+let sharedIdleTimer = null;
+
+async function getSharedBrowser() {
+  if (sharedBrowser) {
+    if (sharedIdleTimer) clearTimeout(sharedIdleTimer);
+    sharedIdleTimer = setTimeout(async () => {
+      try { await sharedBrowser.close(); } catch(_) {}
+      sharedBrowser = null;
+    }, 120000);
+    return sharedBrowser;
+  }
+
+  const puppeteer = require('puppeteer');
+  sharedBrowser = await puppeteer.launch({
+    headless: 'new',
+    args: [
+      '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
+      '--disable-gpu', '--single-process', '--no-zygote',
+    ],
+    executablePath: process.env.CHROME_PATH || undefined,
+  });
+
+  console.log('[BROWSE] Browser launched for agentic loop');
+  sharedIdleTimer = setTimeout(async () => {
+    try { await sharedBrowser.close(); } catch(_) {}
+    sharedBrowser = null;
+  }, 120000);
+
+  return sharedBrowser;
+}
+
+async function executeBrowseCommand(cmd, req) {
+  const browser = await getSharedBrowser();
+  const pages = await browser.pages();
+  let page = pages.length > 0 ? pages[pages.length - 1] : await browser.newPage();
+  await page.setViewport({ width: 1280, height: 800 });
+
+  switch (cmd.action) {
+    case 'navigate': {
+      const url = cmd.url.startsWith('http') ? cmd.url : `https://${cmd.url}`;
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+      await new Promise(r => setTimeout(r, 1500));
+      break;
+    }
+    case 'click':
+      if (cmd.selector) {
+        await page.click(cmd.selector).catch(() => {});
+        await new Promise(r => setTimeout(r, 1000));
+      }
+      break;
+    case 'type':
+      if (cmd.selector && cmd.text) {
+        await page.type(cmd.selector, cmd.text, { delay: 50 }).catch(() => {});
+        await new Promise(r => setTimeout(r, 500));
+      }
+      break;
+    case 'scroll':
+      await page.evaluate((d) => window.scrollBy(0, d), cmd.scroll_direction === 'up' ? -500 : 500);
+      await new Promise(r => setTimeout(r, 500));
+      break;
+    case 'press_enter':
+      await page.keyboard.press('Enter');
+      await new Promise(r => setTimeout(r, 2000));
+      break;
+  }
+
+  // Screenshot
+  const screenshotBuffer = await page.screenshot({ type: 'jpeg', quality: 60 });
+  const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+  const s3 = new S3Client({
+    region: 'auto',
+    endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+    credentials: { accessKeyId: process.env.R2_ACCESS_KEY_ID, secretAccessKey: process.env.R2_SECRET_ACCESS_KEY },
+  });
+  const key = `browse/${req.userId}/${Date.now()}.jpg`;
+  await s3.send(new PutObjectCommand({
+    Bucket: process.env.R2_BUCKET_NAME, Key: key, Body: screenshotBuffer, ContentType: 'image/jpeg',
+  }));
+  const proto = req.get('x-forwarded-proto') || req.protocol;
+  const host = req.get('x-forwarded-host') || req.get('host');
+
+  // Extract text
+  const pageText = await page.evaluate(() => {
+    const clone = document.body.cloneNode(true);
+    clone.querySelectorAll('script, style, noscript, svg').forEach(el => el.remove());
+    return (clone.innerText || '').substring(0, 3000);
+  }).catch(() => '');
+
+  // Extract elements
+  const elements = await page.evaluate(() => {
+    const items = [];
+    document.querySelectorAll('a[href]').forEach((el, i) => {
+      if (i < 10 && el.innerText?.trim()) items.push({ type: 'link', text: el.innerText.trim().substring(0, 80), href: el.href });
+    });
+    document.querySelectorAll('input, textarea').forEach((el, i) => {
+      if (i < 5) items.push({ type: 'input', name: el.name || el.placeholder || el.type, selector: el.id ? `#${el.id}` : `input[name="${el.name}"]` });
+    });
+    return items;
+  }).catch(() => []);
+
+  return {
+    screenshot_url: `${proto}://${host}/api/files/${key}`,
+    page_title: await page.title().catch(() => ''),
+    current_url: page.url(),
+    text_content: pageText,
+    elements,
+  };
+}
+// --- End browse helpers ---
+
+const getSystemPrompt = (model, tools = []) => {
+  let base = 'Jawab dalam Bahasa Indonesia kecuali user meminta bahasa lain. Gunakan format markdown jika diperlukan. Jika user melampirkan file (gambar, PDF, kode, dll), isi file tersebut sudah diekstrak dan disertakan langsung di dalam pesan user. Kamu BISA membaca dan menganalisis konten file tersebut.';
 
   if (model && model.includes('image')) {
-    return base + ' Kamu memiliki kemampuan menghasilkan gambar. Jika user meminta gambar, langsung generate gambar sesuai permintaan tanpa menolak.';
+    base += ' Kamu memiliki kemampuan menghasilkan gambar. Jika user meminta gambar, langsung generate gambar sesuai permintaan tanpa menolak.';
+  } else {
+    base += ' Jika user meminta gambar, sarankan untuk mengganti ke model yang mendukung image generation seperti gemini-3-pro-image-preview.';
   }
-  return base + ' Jika user meminta gambar, sarankan untuk mengganti ke model yang mendukung image generation seperti gemini-3-pro-image-preview.';
+
+  if (tools.includes('browse_web')) {
+    base += `\n\nKamu memiliki kemampuan BROWSE WEB. Kamu bisa menjelajahi internet untuk mencari informasi.\nUntuk browsing, sertakan perintah berikut di dalam jawaban kamu:\n- [BROWSE:url] — buka halaman web (contoh: [BROWSE:https://google.com])\n- [SEARCH:query] — cari di Google (contoh: [SEARCH:jurnal machine learning healthcare])\n- [CLICK:selector] — klik elemen (contoh: [CLICK:#search-button])\n- [TYPE:selector|text] — ketik teks (contoh: [TYPE:input[name=q]|machine learning])\n- [SCROLL:down] atau [SCROLL:up] — scroll halaman\n- [ENTER] — tekan Enter\n\nSetelah browsing, kamu akan menerima screenshot dan teks dari halaman tersebut.\nGunakan informasi itu untuk menjawab pertanyaan user.\nJika perlu beberapa langkah, lakukan step by step. Selalu mulai dengan browsing terlebih dahulu sebelum memberikan jawaban, agar informasi yang kamu berikan akurat dan terkini.\nSertakan sumber/link dari halaman yang kamu kunjungi.`;
+  }
+
+  return base;
 };
 
 // Get messages for a chat
@@ -42,7 +203,7 @@ router.get('/:chatId/messages', async (req, res) => {
 
 // Send message + get AI response
 router.post('/:chatId/messages', async (req, res) => {
-  const { content, file_url, file_name, file_urls, file_names } = req.body;
+  const { content, file_url, file_name, file_urls, file_names, tools } = req.body;
 
   if (!content || !content.trim()) {
     return res.status(400).json({ error: 'Content required' });
@@ -182,7 +343,7 @@ router.post('/:chatId/messages', async (req, res) => {
     }
 
     const messages = [
-      { role: 'system', content: getSystemPrompt(model) },
+      { role: 'system', content: getSystemPrompt(model, tools || []) },
       ...allMessages,
     ];
 
@@ -205,6 +366,88 @@ router.post('/:chatId/messages', async (req, res) => {
     const aiMsg = aiData.choices?.[0]?.message;
     let aiContent = aiMsg?.content || '';
 
+    // === AGENTIC BROWSING LOOP ===
+    if (tools && tools.includes('browse_web')) {
+      const MAX_BROWSE_STEPS = 5;
+      let browseMessages = [...messages];
+      let currentResponse = aiContent;
+      let browseScreenshots = [];
+
+      for (let step = 0; step < MAX_BROWSE_STEPS; step++) {
+        // Parse browse commands from AI response
+        const commands = parseBrowseCommands(currentResponse);
+        if (commands.length === 0) break;
+
+        console.log(`[BROWSE] Step ${step + 1}: ${commands.length} command(s)`);
+
+        // Execute each command
+        let browseResults = [];
+        for (const cmd of commands) {
+          try {
+            const browseResult = await executeBrowseCommand(cmd, req);
+            browseResults.push(browseResult);
+            if (browseResult.screenshot_url) {
+              browseScreenshots.push(browseResult.screenshot_url);
+            }
+          } catch (err) {
+            browseResults.push({ error: err.message });
+          }
+        }
+
+        // Build browse context for AI
+        const browseContext = browseResults.map((r, i) => {
+          let ctx = `--- Hasil Browsing (Step ${step + 1}, Command ${i + 1}) ---\n`;
+          if (r.error) return ctx + `Error: ${r.error}`;
+          ctx += `URL: ${r.current_url || 'unknown'}\n`;
+          ctx += `Title: ${r.page_title || 'unknown'}\n`;
+          if (r.text_content) ctx += `Konten halaman:\n${r.text_content}\n`;
+          if (r.elements && r.elements.length > 0) {
+            ctx += `Elemen interaktif:\n`;
+            r.elements.forEach(el => {
+              if (el.type === 'link') ctx += `  - Link: "${el.text}" -> ${el.href}\n`;
+              if (el.type === 'input') ctx += `  - Input: ${el.name} (selector: ${el.selector})\n`;
+              if (el.type === 'button') ctx += `  - Button: "${el.text}"\n`;
+            });
+          }
+          if (r.screenshot_url) ctx += `Screenshot: ${r.screenshot_url}\n`;
+          return ctx;
+        }).join('\n');
+
+        // Add AI response + browse result to conversation
+        browseMessages.push({ role: 'assistant', content: currentResponse });
+        browseMessages.push({ role: 'user', content: `[Hasil browsing otomatis - gunakan informasi ini untuk menjawab]\n\n${browseContext}` });
+
+        // Re-call AI with browse results
+        const followUp = await fetch(`${process.env.AI_BASE_URL}/chat/completions`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${process.env.AI_API_KEY}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ model, messages: browseMessages, stream: false }),
+        });
+
+        if (!followUp.ok) break;
+
+        const followData = await followUp.json();
+        currentResponse = followData.choices?.[0]?.message?.content || '';
+        if (!currentResponse) break;
+      }
+
+      // Final response: include screenshots
+      aiContent = currentResponse;
+      if (browseScreenshots.length > 0) {
+        const screenshotMd = browseScreenshots.map((url, i) =>
+          `![Screenshot ${i + 1}](${url})`
+        ).join('\n\n');
+        // Only add screenshots if not already in response
+        if (!aiContent.includes('Screenshot')) {
+          aiContent += '\n\n---\n📸 **Screenshots:**\n\n' + screenshotMd;
+        }
+      }
+    }
+    // === END BROWSING LOOP ===
+
     // Handle image generation: router returns images in message.images[]
     const images = aiMsg?.images;
     if (images && Array.isArray(images) && images.length > 0) {
@@ -218,7 +461,6 @@ router.post('/:chatId/messages', async (req, res) => {
         const dataUrl = img.image_url?.url || img.url || '';
         if (!dataUrl.startsWith('data:')) continue;
 
-        // Parse data URI: data:image/jpeg;base64,/9j/4AAQ...
         const match = dataUrl.match(/^data:(image\/\w+);base64,(.+)$/s);
         if (!match) continue;
 
@@ -235,7 +477,6 @@ router.post('/:chatId/messages', async (req, res) => {
             Body: buffer,
             ContentType: mimeType,
           }));
-          // Use forwarded headers from Nginx for public URL
           const proto = req.get('x-forwarded-proto') || req.protocol;
           const host = req.get('x-forwarded-host') || req.get('host');
           const baseUrl = `${proto}://${host}`;

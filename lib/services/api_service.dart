@@ -145,6 +145,7 @@ class ApiService {
     int chatId,
     String content, {
     List<PendingFile>? files,
+    List<String>? tools,
   }) async {
     final body = <String, dynamic>{
       'content': content,
@@ -153,9 +154,12 @@ class ApiService {
     if (files != null && files.isNotEmpty) {
       body['file_urls'] = files.map((f) => f.url).toList();
       body['file_names'] = files.map((f) => f.name).toList();
-      // Backward compat: also send single file_url/file_name
       body['file_url'] = files.first.url;
       body['file_name'] = files.first.name;
+    }
+
+    if (tools != null && tools.isNotEmpty) {
+      body['tools'] = tools;
     }
 
     final response = await http.post(

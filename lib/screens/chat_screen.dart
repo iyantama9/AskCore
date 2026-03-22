@@ -41,6 +41,9 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
   // File attachments (up to 5)
   List<PendingFile> _pendingFiles = [];
 
+  // Active tools
+  Set<ChatTool> _activeTools = {};
+
   // Track the typing message index for scoped rebuilds
   int? _typingIndex;
 
@@ -264,6 +267,7 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
         _selectedChatId!,
         content,
         files: _pendingFiles,
+        tools: _activeTools.map((t) => t == ChatTool.browseWeb ? 'browse_web' : 'create_image').toList(),
       );
 
       final aiContent = result['message']?['content'] ?? 'No response';
@@ -319,6 +323,23 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
 
   void _clearAllAttachments() {
     setState(() => _pendingFiles.clear());
+  }
+
+  void _handleToolToggle(ChatTool tool) {
+    setState(() {
+      if (_activeTools.contains(tool)) {
+        _activeTools.remove(tool);
+      } else {
+        _activeTools.add(tool);
+      }
+      // Auto-switch model for create_image
+      if (tool == ChatTool.createImage && _activeTools.contains(tool)) {
+        _currentModel = 'gemini-2.0-flash-preview-image-generation';
+        if (_selectedChatId != null) {
+          _api.updateChatModel(_selectedChatId!, _currentModel);
+        }
+      }
+    });
   }
 
   @override
@@ -385,6 +406,8 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
                 attachedFiles: _pendingFiles,
                 onRemoveAttachment: _removeAttachment,
                 onClearAllAttachments: _clearAllAttachments,
+                activeTools: _activeTools,
+                onToolToggled: _handleToolToggle,
               ),
             ),
           ),
