@@ -416,7 +416,13 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
           child: ModelSelector(
             currentModel: _currentModel,
             models: _models,
-            onModelChanged: (model) => setState(() => _currentModel = model),
+            onModelChanged: (model) {
+              setState(() => _currentModel = model);
+              // Persist model change to database for the active chat
+              if (_selectedChatId != null) {
+                ApiService().updateChatModel(_selectedChatId!, model);
+              }
+            },
           ),
         ),
         // Playground only on desktop (web-only feature)

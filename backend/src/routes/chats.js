@@ -37,21 +37,24 @@ router.post('/', async (req, res) => {
   }
 });
 
-// Rename chat
+// Update chat (title and/or model)
 router.put('/:id', async (req, res) => {
-  const { title } = req.body;
+  const { title, model } = req.body;
   try {
     const result = await pool.query(
-      `UPDATE chats SET title = $1, updated_at = NOW()
-       WHERE id = $2 AND user_id = $3 RETURNING *`,
-      [title, req.params.id, req.userId]
+      `UPDATE chats SET
+        title = COALESCE($1, title),
+        model = COALESCE($2, model),
+        updated_at = NOW()
+       WHERE id = $3 AND user_id = $4 RETURNING *`,
+      [title, model, req.params.id, req.userId]
     );
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Chat not found' });
     }
     res.json(result.rows[0]);
   } catch (err) {
-    console.error('Rename chat error:', err);
+    console.error('Update chat error:', err);
     res.status(500).json({ error: 'Server error' });
   }
 });

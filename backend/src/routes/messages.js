@@ -230,7 +230,10 @@ router.post('/:chatId/messages', async (req, res) => {
             Body: buffer,
             ContentType: mimeType,
           }));
-          const baseUrl = `${req.protocol}://${req.get('host')}`;
+          // Use forwarded headers from Nginx for public URL
+          const proto = req.get('x-forwarded-proto') || req.protocol;
+          const host = req.get('x-forwarded-host') || req.get('host');
+          const baseUrl = `${proto}://${host}`;
           contentParts.push(`![Generated Image](${baseUrl}/api/files/${key})`);
         } catch (uploadErr) {
           console.error('Image upload to R2 error:', uploadErr);

@@ -4,9 +4,9 @@ class AppConstants {
 
   static const String appName = 'AskCore';
 
-  /// Production backend via Nginx (port 80 proxies /api/ to Node.js)
+  /// Production backend via Nginx + Let's Encrypt SSL
   /// For local dev, change to: 'http://localhost:4000'
-  static const String backendUrl = 'http://143.198.214.130';
+  static const String backendUrl = 'https://askcore.duckdns.org';
 
   static const String defaultModel = 'gemini-2.5-flash-lite';
 
