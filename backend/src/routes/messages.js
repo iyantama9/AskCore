@@ -170,7 +170,30 @@ const getSystemPrompt = (model, tools = []) => {
   }
 
   if (tools.includes('browse_web')) {
-    base += `\n\nKamu memiliki kemampuan BROWSE WEB. Kamu bisa menjelajahi internet untuk mencari informasi.\nUntuk browsing, sertakan perintah berikut di dalam jawaban kamu:\n- [BROWSE:url] — buka halaman web (contoh: [BROWSE:https://google.com])\n- [SEARCH:query] — cari di Google (contoh: [SEARCH:jurnal machine learning healthcare])\n- [CLICK:selector] — klik elemen (contoh: [CLICK:#search-button])\n- [TYPE:selector|text] — ketik teks (contoh: [TYPE:input[name=q]|machine learning])\n- [SCROLL:down] atau [SCROLL:up] — scroll halaman\n- [ENTER] — tekan Enter\n\nSetelah browsing, kamu akan menerima screenshot dan teks dari halaman tersebut.\nGunakan informasi itu untuk menjawab pertanyaan user.\nJika perlu beberapa langkah, lakukan step by step. Selalu mulai dengan browsing terlebih dahulu sebelum memberikan jawaban, agar informasi yang kamu berikan akurat dan terkini.\nSertakan sumber/link dari halaman yang kamu kunjungi.`;
+    base += `\n\nIMPORTANT: Kamu memiliki kemampuan BROWSE WEB yang AKTIF dan BERFUNGSI. Browser kamu sudah siap dan bisa digunakan langsung TANPA ERROR. Jangan pernah bilang kamu tidak bisa browsing atau ada error — browser PASTI berfungsi.
+
+Ketika user meminta informasi dari internet, kamu WAJIB memulai jawaban dengan perintah browsing. JANGAN menjawab dari pengetahuan saja — SELALU cari dulu di internet.
+
+Perintah yang tersedia:
+- [SEARCH:query] — cari di Google (UTAMAKAN ini untuk mencari informasi)
+- [BROWSE:url] — buka URL spesifik
+- [CLICK:css_selector] — klik elemen
+- [TYPE:css_selector|teks] — ketik teks di input field
+- [SCROLL:down] atau [SCROLL:up] — scroll halaman
+- [ENTER] — tekan Enter
+
+ATURAN:
+1. Jawaban pertama kamu HARUS dimulai dengan [SEARCH:...] atau [BROWSE:...]. Tidak boleh ada teks lain sebelum perintah browsing.
+2. Setelah menerima hasil browsing, jawab pertanyaan user berdasarkan informasi dari web. Jangan keluarkan perintah browsing lagi kecuali perlu langkah tambahan.
+3. Sertakan sumber URL di jawaban akhir.
+
+Contoh jawaban pertama yang BENAR:
+User: "carikan jurnal machine learning"
+Kamu: [SEARCH:machine learning journal paper 2024]
+
+Contoh yang SALAH:
+User: "carikan jurnal machine learning"  
+Kamu: "Maaf, saya tidak bisa browsing karena..." (INI DILARANG)`;
   }
 
   return base;
@@ -434,16 +457,30 @@ router.post('/:chatId/messages', async (req, res) => {
         if (!currentResponse) break;
       }
 
-      // Final response: include screenshots
+      // Final response: strip any remaining browse commands and include screenshots
       aiContent = currentResponse;
+
+      // Strip browse commands from final response
+      aiContent = aiContent.replace(/\[BROWSE:[^\]]+\]/gi, '');
+      aiContent = aiContent.replace(/\[SEARCH:[^\]]+\]/gi, '');
+      aiContent = aiContent.replace(/\[CLICK:[^\]]+\]/gi, '');
+      aiContent = aiContent.replace(/\[TYPE:[^\]]+\]/gi, '');
+      aiContent = aiContent.replace(/\[SCROLL:(up|down)\]/gi, '');
+      aiContent = aiContent.replace(/\[ENTER\]/gi, '');
+      aiContent = aiContent.trim();
+
       if (browseScreenshots.length > 0) {
         const screenshotMd = browseScreenshots.map((url, i) =>
           `![Screenshot ${i + 1}](${url})`
         ).join('\n\n');
-        // Only add screenshots if not already in response
         if (!aiContent.includes('Screenshot')) {
           aiContent += '\n\n---\n📸 **Screenshots:**\n\n' + screenshotMd;
         }
+      }
+
+      // If browse ran but AI still returned empty, provide fallback
+      if (!aiContent || aiContent.length < 10) {
+        aiContent = 'Browsing selesai, tapi AI tidak memberikan ringkasan. Silakan coba lagi dengan pertanyaan yang lebih spesifik.';
       }
     }
     // === END BROWSING LOOP ===
