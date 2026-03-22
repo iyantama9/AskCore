@@ -42,11 +42,15 @@ router.get('/:chatId/messages', async (req, res) => {
 
 // Send message + get AI response
 router.post('/:chatId/messages', async (req, res) => {
-  const { content, file_url, file_name } = req.body;
+  const { content, file_url, file_name, file_urls, file_names } = req.body;
 
   if (!content || !content.trim()) {
     return res.status(400).json({ error: 'Content required' });
   }
+
+  // Support both single and multi file (backward compat)
+  const urls = file_urls || (file_url ? [file_url] : []);
+  const names = file_names || (file_name ? [file_name] : []);
 
   try {
     // Verify chat belongs to user
@@ -60,11 +64,11 @@ router.post('/:chatId/messages', async (req, res) => {
 
     const model = chat.rows[0].model;
 
-    // Save user message
+    // Save user message (store first file for backward compat in DB)
     await pool.query(
       `INSERT INTO messages (chat_id, role, content, file_url, file_name)
        VALUES ($1, 'user', $2, $3, $4)`,
-      [req.params.chatId, content, file_url || null, file_name || null]
+      [req.params.chatId, content, urls[0] || null, names[0] || null]
     );
 
     // Get all messages for context
@@ -102,11 +106,18 @@ router.post('/:chatId/messages', async (req, res) => {
       return Buffer.concat(chunks);
     };
 
-    // If the latest message has a file, process it for the AI
+    // Process all attached files for the AI
     let useMultimodal = false;
-    console.log('[FILE] file_url:', file_url, 'file_name:', file_name);
-    if (file_url && file_name) {
-      const ext = file_name.split('.').pop()?.toLowerCase() || '';
+    const imageParts = []; // Collect all image parts for multimodal
+
+    for (let i = 0; i < urls.length; i++) {
+      const fileUrl = urls[i];
+      const fileName = names[i] || 'file';
+      console.log(`[FILE ${i + 1}/${urls.length}] file_url:`, fileUrl, 'file_name:', fileName);
+
+      if (!fileUrl || !fileName) continue;
+
+      const ext = fileName.split('.').pop()?.toLowerCase() || '';
       const imageExts = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'];
       const textExts = [
         'dart', 'js', 'ts', 'jsx', 'tsx', 'py', 'java', 'kt', 'swift',
@@ -121,58 +132,52 @@ router.post('/:chatId/messages', async (req, res) => {
 
       try {
         if (imageExts.includes(ext)) {
-          // Images → base64 multimodal content
-          const buffer = await readFileFromR2(file_url);
+          const buffer = await readFileFromR2(fileUrl);
           const base64 = buffer.toString('base64');
           const mimeMap = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp' };
           const mime = mimeMap[ext] || 'image/png';
-
-          const lastMsg = allMessages[allMessages.length - 1];
-          if (lastMsg && lastMsg.role === 'user') {
-            // Convert to multimodal content format
-            lastMsg.content = [
-              { type: 'text', text: lastMsg.content },
-              { type: 'image_url', image_url: { url: `data:${mime};base64,${base64}` } },
-            ];
-            useMultimodal = true;
-          }
+          imageParts.push({ type: 'image_url', image_url: { url: `data:${mime};base64,${base64}` } });
+          useMultimodal = true;
         } else if (ext === 'pdf') {
-          // PDF → extract text with pdf-parse
-          console.log('[PDF] Reading from R2:', file_url);
-          const buffer = await readFileFromR2(file_url);
-          console.log('[PDF] Buffer size:', buffer.length);
+          const buffer = await readFileFromR2(fileUrl);
           const pdfParse = require('pdf-parse');
           const pdfData = await pdfParse(buffer);
           const pdfText = pdfData.text?.substring(0, 15000) || '[PDF kosong]';
-          console.log('[PDF] Extracted', pdfText.length, 'chars from', pdfData.numpages, 'pages');
-
           const lastMsg = allMessages[allMessages.length - 1];
           if (lastMsg && lastMsg.role === 'user') {
-            lastMsg.content += `\n\n--- Isi dokumen PDF: ${file_name} (${pdfData.numpages} halaman) ---\n${pdfText}\n--- Akhir dokumen ---`;
-            console.log('[PDF] Content appended to user message');
+            lastMsg.content += `\n\n--- Isi dokumen PDF: ${fileName} (${pdfData.numpages} halaman) ---\n${pdfText}\n--- Akhir dokumen ---`;
           }
         } else if (textExts.includes(ext)) {
-          // Code/text → read content
-          const buffer = await readFileFromR2(file_url);
+          const buffer = await readFileFromR2(fileUrl);
           const fileContent = buffer.toString('utf-8').substring(0, 15000);
-
           const lastMsg = allMessages[allMessages.length - 1];
           if (lastMsg && lastMsg.role === 'user') {
-            lastMsg.content += `\n\n--- File: ${file_name} ---\n${fileContent}\n--- End of file ---`;
+            lastMsg.content += `\n\n--- File: ${fileName} ---\n${fileContent}\n--- End of file ---`;
           }
         } else {
-          // PPT/other → mention filename
           const lastMsg = allMessages[allMessages.length - 1];
           if (lastMsg && lastMsg.role === 'user') {
-            lastMsg.content += `\n\n[User melampirkan dokumen: ${file_name}. Analisis berdasarkan konteks percakapan.]`;
+            lastMsg.content += `\n\n[User melampirkan dokumen: ${fileName}. Analisis berdasarkan konteks percakapan.]`;
           }
         }
       } catch (fileErr) {
-        console.error('[FILE ERROR]', fileErr.message, fileErr.stack);
+        console.error(`[FILE ERROR ${i}]`, fileErr.message);
         const lastMsg = allMessages[allMessages.length - 1];
         if (lastMsg && lastMsg.role === 'user') {
-          lastMsg.content += `\n\n[File terlampir: ${file_name} - Error: ${fileErr.message}]`;
+          lastMsg.content += `\n\n[File terlampir: ${fileName} - Error: ${fileErr.message}]`;
         }
+      }
+    }
+
+    // After processing all files, assemble multimodal content if images exist
+    if (useMultimodal && imageParts.length > 0) {
+      const lastMsg = allMessages[allMessages.length - 1];
+      if (lastMsg && lastMsg.role === 'user') {
+        const textContent = typeof lastMsg.content === 'string' ? lastMsg.content : lastMsg.content;
+        lastMsg.content = [
+          { type: 'text', text: textContent },
+          ...imageParts,
+        ];
       }
     }
 

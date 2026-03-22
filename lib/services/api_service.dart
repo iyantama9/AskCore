@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'package:http/http.dart' as http;
+import '../widgets/chat_input.dart';
 import 'package:http_parser/http_parser.dart' as http_parser;
 import 'package:shared_preferences/shared_preferences.dart';
 import '../core/constants.dart';
@@ -143,17 +144,24 @@ class ApiService {
   Future<Map<String, dynamic>> sendMessage(
     int chatId,
     String content, {
-    String? fileUrl,
-    String? fileName,
+    List<PendingFile>? files,
   }) async {
+    final body = <String, dynamic>{
+      'content': content,
+    };
+
+    if (files != null && files.isNotEmpty) {
+      body['file_urls'] = files.map((f) => f.url).toList();
+      body['file_names'] = files.map((f) => f.name).toList();
+      // Backward compat: also send single file_url/file_name
+      body['file_url'] = files.first.url;
+      body['file_name'] = files.first.name;
+    }
+
     final response = await http.post(
       Uri.parse('${AppConstants.backendUrl}/api/chats/$chatId/messages'),
       headers: _authHeaders,
-      body: jsonEncode({
-        'content': content,
-        'file_url': fileUrl,
-        'file_name': fileName,
-      }),
+      body: jsonEncode(body),
     );
     if (response.statusCode == 200) {
       return jsonDecode(response.body);

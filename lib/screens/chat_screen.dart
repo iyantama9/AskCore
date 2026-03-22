@@ -1,5 +1,7 @@
 import 'dart:async';
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
+import '../helpers/clipboard_paste.dart';
 import '../core/constants.dart';
 import '../main.dart';
 import '../models/message_model.dart';
@@ -36,9 +38,8 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
   // Only animate the LATEST 2 messages (user + assistant)
   final Map<String, AnimationController> _animControllers = {};
 
-  // File attachment
-  String? _pendingFileUrl;
-  String? _pendingFileName;
+  // File attachments (up to 5)
+  List<PendingFile> _pendingFiles = [];
 
   // Track the typing message index for scoped rebuilds
   int? _typingIndex;
@@ -47,10 +48,30 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
   void initState() {
     super.initState();
     _loadChats();
+    // Setup web clipboard paste listener for images
+    setupWebPasteListener(_onImagePasted);
+  }
+
+  Future<void> _onImagePasted(Uint8List bytes, String mimeType) async {
+    if (_pendingFiles.length >= 5) return;
+    final ext = mimeType.split('/').last;
+    final fileName = 'pasted_${DateTime.now().millisecondsSinceEpoch}.$ext';
+    try {
+      final result = await _api.uploadFile(bytes, fileName, mimeType);
+      if (mounted) {
+        setState(() {
+          _pendingFiles.add(PendingFile(
+            url: result['key'] ?? '',
+            name: result['file_name'] ?? fileName,
+          ));
+        });
+      }
+    } catch (_) {}
   }
 
   @override
   void dispose() {
+    disposeWebPasteListener();
     _scrollController.dispose();
     _typewriterTimer?.cancel();
     for (final c in _animControllers.values) {
@@ -215,8 +236,9 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
     }
 
     String userContent = content;
-    if (_pendingFileName != null) {
-      userContent += '\n\n📎 $_pendingFileName';
+    if (_pendingFiles.isNotEmpty) {
+      final names = _pendingFiles.map((f) => '📎 ${f.name}').join('\n');
+      userContent += '\n\n$names';
     }
 
     // Clean up old animation controllers
@@ -241,8 +263,7 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
       final result = await _api.sendMessage(
         _selectedChatId!,
         content,
-        fileUrl: _pendingFileUrl,
-        fileName: _pendingFileName,
+        files: _pendingFiles,
       );
 
       final aiContent = result['message']?['content'] ?? 'No response';
@@ -263,8 +284,7 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
         setState(() {
           _messages[idx] = aiMsg;
           _isLoading = false;
-          _pendingFileUrl = null;
-          _pendingFileName = null;
+          _pendingFiles = [];
           _typingIndex = idx;
         });
         _startTypewriter(idx, aiContent);
@@ -289,18 +309,16 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
     _scrollToBottom();
   }
 
-  void _handleFileUploaded(Map<String, dynamic> fileData) {
-    setState(() {
-      _pendingFileUrl = fileData['key'];
-      _pendingFileName = fileData['file_name'];
-    });
+  void _handleFileAdded(PendingFile file) {
+    setState(() => _pendingFiles.add(file));
   }
 
-  void _clearAttachment() {
-    setState(() {
-      _pendingFileUrl = null;
-      _pendingFileName = null;
-    });
+  void _removeAttachment(int index) {
+    setState(() => _pendingFiles.removeAt(index));
+  }
+
+  void _clearAllAttachments() {
+    setState(() => _pendingFiles.clear());
   }
 
   @override
@@ -363,9 +381,10 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
               child: ChatInput(
                 onSend: _sendMessage,
                 isLoading: _isLoading,
-                onFileUploaded: _handleFileUploaded,
-                attachedFileName: _pendingFileName,
-                onClearAttachment: _clearAttachment,
+                onFileAdded: _handleFileAdded,
+                attachedFiles: _pendingFiles,
+                onRemoveAttachment: _removeAttachment,
+                onClearAllAttachments: _clearAllAttachments,
               ),
             ),
           ),

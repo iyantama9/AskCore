@@ -1,23 +1,34 @@
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import '../core/constants.dart';
 import '../services/api_service.dart';
+
+/// Represents a pending file attachment (uploaded or pasted).
+class PendingFile {
+  final String url;
+  final String name;
+  const PendingFile({required this.url, required this.name});
+}
 
 class ChatInput extends StatefulWidget {
   final ValueChanged<String> onSend;
   final bool isLoading;
-  final ValueChanged<Map<String, dynamic>>? onFileUploaded;
-  final String? attachedFileName;
-  final VoidCallback? onClearAttachment;
+  final ValueChanged<PendingFile>? onFileAdded;
+  final VoidCallback? onClearAllAttachments;
+  final ValueChanged<int>? onRemoveAttachment;
+  final List<PendingFile> attachedFiles;
 
   const ChatInput({
     super.key,
     required this.onSend,
     this.isLoading = false,
-    this.onFileUploaded,
-    this.attachedFileName,
-    this.onClearAttachment,
+    this.onFileAdded,
+    this.onClearAllAttachments,
+    this.onRemoveAttachment,
+    this.attachedFiles = const [],
   });
 
   @override
@@ -32,11 +43,11 @@ class _ChatInputState extends State<ChatInput>
   bool _hasText = false;
   bool _isUploading = false;
 
+  static const int maxFiles = 5;
+
   // Allowed extensions
   static const List<String> _allowedExtensions = [
-    // Images
     'jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg',
-    // Code files
     'dart', 'js', 'ts', 'jsx', 'tsx', 'py', 'java', 'kt', 'swift',
     'c', 'cpp', 'h', 'hpp', 'cs', 'go', 'rs', 'rb', 'php',
     'html', 'css', 'scss', 'sass', 'less',
@@ -46,7 +57,6 @@ class _ChatInputState extends State<ChatInput>
     'vue', 'svelte', 'astro',
     'r', 'lua', 'perl', 'scala', 'clj', 'ex', 'exs', 'erl',
     'dockerfile', 'makefile', 'cmake',
-    // Documents
     'pdf', 'ppt', 'pptx',
   ];
 
@@ -84,28 +94,20 @@ class _ChatInputState extends State<ChatInput>
     _focusNode.requestFocus();
   }
 
-  Future<void> _pickFile() async {
-    if (_isUploading || widget.isLoading) return;
+  bool get _canAddMore => widget.attachedFiles.length < maxFiles;
 
-    final result = await FilePicker.platform.pickFiles(
-      type: FileType.custom,
-      allowedExtensions: _allowedExtensions,
-      withData: true,
-    );
-
-    if (result == null || result.files.isEmpty) return;
-    final file = result.files.first;
-
-    if (file.bytes == null) {
+  /// Upload raw bytes (from clipboard or file picker)
+  Future<void> _uploadBytes(Uint8List bytes, String fileName, String contentType) async {
+    if (!_canAddMore) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('File tidak bisa dibaca')),
+          const SnackBar(content: Text('Maksimal 5 file per pesan')),
         );
       }
       return;
     }
 
-    if (file.size > AppConstants.maxFileSize) {
+    if (bytes.length > AppConstants.maxFileSize) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('File terlalu besar (maks 1MB)')),
@@ -117,28 +119,11 @@ class _ChatInputState extends State<ChatInput>
     setState(() => _isUploading = true);
 
     try {
-      final ext = file.extension?.toLowerCase() ?? '';
-      String contentType = 'application/octet-stream';
-      if (['jpg', 'jpeg'].contains(ext)) contentType = 'image/jpeg';
-      if (ext == 'png') contentType = 'image/png';
-      if (ext == 'gif') contentType = 'image/gif';
-      if (ext == 'webp') contentType = 'image/webp';
-      if (ext == 'pdf') contentType = 'application/pdf';
-      if (ext == 'ppt' || ext == 'pptx') {
-        contentType = 'application/vnd.ms-powerpoint';
-      }
-      if (ext == 'svg') contentType = 'image/svg+xml';
-      if (ext == 'txt' || ext == 'md' || ext == 'log' || ext == 'csv') {
-        contentType = 'text/plain';
-      }
-
-      final uploadResult = await ApiService().uploadFile(
-        file.bytes!,
-        file.name,
-        contentType,
-      );
-
-      widget.onFileUploaded?.call(uploadResult);
+      final uploadResult = await ApiService().uploadFile(bytes, fileName, contentType);
+      widget.onFileAdded?.call(PendingFile(
+        url: uploadResult['url'] ?? '',
+        name: uploadResult['name'] ?? fileName,
+      ));
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -150,10 +135,86 @@ class _ChatInputState extends State<ChatInput>
     }
   }
 
+  /// Handle clipboard paste (Ctrl+V / Cmd+V)
+  Future<void> _handlePaste() async {
+    try {
+      final data = await Clipboard.getData('text/plain');
+      // On web, check for image data from clipboard API
+      if (kIsWeb) {
+        // Use the HTML paste event approach via the Focus widget below
+        return;
+      }
+      // On mobile/desktop, clipboard images are not directly accessible
+      // via Clipboard.getData. Users can use file picker instead.
+      if (data?.text != null) {
+        // Let the text field handle text paste normally
+        return;
+      }
+    } catch (_) {}
+  }
+
+  /// Handle pasted image bytes (from web clipboard event)
+  Future<void> handlePastedImage(Uint8List bytes, String mimeType) async {
+    final ext = mimeType.split('/').last;
+    final fileName = 'pasted_image_${DateTime.now().millisecondsSinceEpoch}.$ext';
+    await _uploadBytes(bytes, fileName, mimeType);
+  }
+
+  Future<void> _pickFile() async {
+    if (_isUploading || widget.isLoading || !_canAddMore) {
+      if (!_canAddMore && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Maksimal 5 file per pesan')),
+        );
+      }
+      return;
+    }
+
+    final remaining = maxFiles - widget.attachedFiles.length;
+
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: _allowedExtensions,
+      withData: true,
+      allowMultiple: remaining > 1,
+    );
+
+    if (result == null || result.files.isEmpty) return;
+
+    // Take only up to remaining slots
+    final files = result.files.take(remaining).toList();
+
+    for (final file in files) {
+      if (file.bytes == null) continue;
+
+      if (file.size > AppConstants.maxFileSize) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('${file.name} terlalu besar (maks 1MB)')),
+          );
+        }
+        continue;
+      }
+
+      final ext = file.extension?.toLowerCase() ?? '';
+      String contentType = 'application/octet-stream';
+      if (['jpg', 'jpeg'].contains(ext)) contentType = 'image/jpeg';
+      if (ext == 'png') contentType = 'image/png';
+      if (ext == 'gif') contentType = 'image/gif';
+      if (ext == 'webp') contentType = 'image/webp';
+      if (ext == 'pdf') contentType = 'application/pdf';
+      if (ext == 'ppt' || ext == 'pptx') contentType = 'application/vnd.ms-powerpoint';
+      if (ext == 'svg') contentType = 'image/svg+xml';
+      if (['txt', 'md', 'log', 'csv'].contains(ext)) contentType = 'text/plain';
+
+      await _uploadBytes(file.bytes!, file.name, contentType);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final hasAttachment = widget.attachedFileName != null;
+    final hasAttachments = widget.attachedFiles.isNotEmpty;
 
     return Container(
       padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
@@ -162,51 +223,17 @@ class _ChatInputState extends State<ChatInput>
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            // Attached file chip
-            if (hasAttachment)
+            // Attached files chips
+            if (hasAttachments)
               Padding(
                 padding: const EdgeInsets.only(bottom: 8),
-                child: Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                  decoration: BoxDecoration(
-                    color: theme.colorScheme.primary.withValues(alpha: 0.1),
-                    borderRadius: BorderRadius.circular(20),
-                    border: Border.all(
-                      color: theme.colorScheme.primary.withValues(alpha: 0.3),
-                    ),
-                  ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(
-                        _getFileIcon(widget.attachedFileName!),
-                        size: 16,
-                        color: theme.colorScheme.primary,
-                      ),
-                      const SizedBox(width: 6),
-                      Flexible(
-                        child: Text(
-                          widget.attachedFileName!,
-                          style: theme.textTheme.bodySmall?.copyWith(
-                            color: theme.colorScheme.primary,
-                            fontWeight: FontWeight.w500,
-                          ),
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                      ),
-                      const SizedBox(width: 4),
-                      InkWell(
-                        onTap: widget.onClearAttachment,
-                        borderRadius: BorderRadius.circular(12),
-                        child: Icon(
-                          Icons.close_rounded,
-                          size: 16,
-                          color: theme.colorScheme.primary,
-                        ),
-                      ),
-                    ],
-                  ),
+                child: Wrap(
+                  spacing: 8,
+                  runSpacing: 4,
+                  children: [
+                    for (int i = 0; i < widget.attachedFiles.length; i++)
+                      _buildFileChip(theme, widget.attachedFiles[i], i),
+                  ],
                 ),
               ),
             // Input row
@@ -225,7 +252,7 @@ class _ChatInputState extends State<ChatInput>
                     child: Row(
                       crossAxisAlignment: CrossAxisAlignment.end,
                       children: [
-                        // Attach button inside the input
+                        // Attach button
                         Padding(
                           padding: const EdgeInsets.only(left: 4, bottom: 4),
                           child: IconButton(
@@ -236,18 +263,23 @@ class _ChatInputState extends State<ChatInput>
                                     height: 18,
                                     child: CircularProgressIndicator(
                                       strokeWidth: 2,
-                                      color:
-                                          theme.colorScheme.onSurfaceVariant,
+                                      color: theme.colorScheme.onSurfaceVariant,
                                     ),
                                   )
-                                : Icon(
-                                    Icons.add_rounded,
-                                    size: 22,
-                                    color: hasAttachment
-                                        ? theme.colorScheme.primary
-                                        : theme.colorScheme.onSurfaceVariant,
+                                : Badge(
+                                    isLabelVisible: hasAttachments,
+                                    label: Text('${widget.attachedFiles.length}'),
+                                    child: Icon(
+                                      Icons.add_rounded,
+                                      size: 22,
+                                      color: hasAttachments
+                                          ? theme.colorScheme.primary
+                                          : theme.colorScheme.onSurfaceVariant,
+                                    ),
                                   ),
-                            tooltip: 'Attach file',
+                            tooltip: _canAddMore
+                                ? 'Attach file (${widget.attachedFiles.length}/$maxFiles)'
+                                : 'Maksimal $maxFiles file',
                             padding: const EdgeInsets.all(8),
                             constraints: const BoxConstraints(
                               minWidth: 36,
@@ -352,6 +384,52 @@ class _ChatInputState extends State<ChatInput>
             ),
           ],
         ),
+      ),
+    );
+  }
+
+  Widget _buildFileChip(ThemeData theme, PendingFile file, int index) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.primary.withValues(alpha: 0.1),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(
+          color: theme.colorScheme.primary.withValues(alpha: 0.3),
+        ),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            _getFileIcon(file.name),
+            size: 14,
+            color: theme.colorScheme.primary,
+          ),
+          const SizedBox(width: 4),
+          ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 120),
+            child: Text(
+              file.name,
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.primary,
+                fontWeight: FontWeight.w500,
+                fontSize: 11,
+              ),
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+          const SizedBox(width: 2),
+          InkWell(
+            onTap: () => widget.onRemoveAttachment?.call(index),
+            borderRadius: BorderRadius.circular(10),
+            child: Icon(
+              Icons.close_rounded,
+              size: 14,
+              color: theme.colorScheme.primary,
+            ),
+          ),
+        ],
       ),
     );
   }
