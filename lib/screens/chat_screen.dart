@@ -334,7 +334,7 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
       }
       // Auto-switch model for create_image
       if (tool == ChatTool.createImage && _activeTools.contains(tool)) {
-        _currentModel = 'gemini-2.0-flash-preview-image-generation';
+        _currentModel = 'gemini-3-pro-image-preview';
         if (_selectedChatId != null) {
           _api.updateChatModel(_selectedChatId!, _currentModel);
         }
