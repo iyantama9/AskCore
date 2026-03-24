@@ -15,45 +15,55 @@ async function executeSearch(query) {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
         'Accept': 'text/html',
-        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Language': 'en-US,en;q=0.9,id;q=0.8',
       },
     });
     const html = await resp.text();
 
-    // Parse search results from DuckDuckGo Lite HTML
+    // Parse DuckDuckGo Lite HTML results
+    // Links: <a rel="nofollow" href="//duckduckgo.com/l/?uddg=ENCODED_URL" class='result-link'>Title</a>
+    // Snippets: <td class='result-snippet'>text</td>
     const results = [];
-    // DuckDuckGo Lite uses <a> tags with class="result-link" or simple <a href> in result rows
-    const linkRegex = /<a[^>]+rel="nofollow"[^>]+href="([^"]+)"[^>]*>([^<]+)<\/a>/gi;
-    const snippetRegex = /<td[^>]*class="result-snippet"[^>]*>([\s\S]*?)<\/td>/gi;
 
+    // Extract result links with class='result-link'
+    const linkRegex = /<a[^>]+class=['"]result-link['"][^>]*href=['"]([^'"]+)['"][^>]*>([^<]+)<\/a>|<a[^>]+href=['"]([^'"]+)['"][^>]*class=['"]result-link['"][^>]*>([^<]+)<\/a>/gi;
     let match;
     while ((match = linkRegex.exec(html)) !== null) {
-      const href = match[1];
-      const title = match[2].replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#x27;/g, "'").trim();
-      if (href.startsWith('http') && !href.includes('duckduckgo.com')) {
-        results.push({ title, url: href, snippet: '' });
+      const rawHref = match[1] || match[3];
+      const title = (match[2] || match[4] || '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#x27;/g, "'").replace(/&#39;/g, "'").trim();
+
+      // Extract actual URL from DDG redirect: //duckduckgo.com/l/?uddg=ENCODED_URL
+      let actualUrl = rawHref;
+      const uddgMatch = rawHref.match(/[?&]uddg=([^&]+)/);
+      if (uddgMatch) {
+        actualUrl = decodeURIComponent(uddgMatch[1]);
+      } else if (rawHref.startsWith('//')) {
+        actualUrl = 'https:' + rawHref;
+      }
+
+      if (actualUrl.startsWith('http') && !actualUrl.includes('duckduckgo.com')) {
+        results.push({ title, url: actualUrl, snippet: '' });
       }
     }
 
-    // Try to get snippets
+    // Extract snippets
+    const snippetRegex = /<td[^>]*class=['"]result-snippet['"][^>]*>([\s\S]*?)<\/td>/gi;
     let snippetMatch;
     let idx = 0;
     while ((snippetMatch = snippetRegex.exec(html)) !== null && idx < results.length) {
-      results[idx].snippet = snippetMatch[1].replace(/<[^>]+>/g, '').replace(/&amp;/g, '&').trim().substring(0, 200);
+      const snippet = snippetMatch[1]
+        .replace(/<[^>]+>/g, '')
+        .replace(/&amp;/g, '&')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&#x27;/g, "'")
+        .replace(/&#39;/g, "'")
+        .replace(/&nbsp;/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .substring(0, 300);
+      results[idx].snippet = snippet;
       idx++;
-    }
-
-    // Format results as text for AI
-    if (results.length === 0) {
-      // Fallback: extract any <a href> links from the page
-      const fallbackRegex = /<a[^>]+href="(https?:\/\/[^"]+)"[^>]*>([^<]+)<\/a>/gi;
-      while ((match = fallbackRegex.exec(html)) !== null && results.length < 10) {
-        const href = match[1];
-        const title = match[2].trim();
-        if (!href.includes('duckduckgo.com') && title.length > 5) {
-          results.push({ title, url: href, snippet: '' });
-        }
-      }
     }
 
     const top = results.slice(0, 10);
@@ -63,6 +73,10 @@ async function executeSearch(query) {
       if (r.snippet) text += `   ${r.snippet}\n`;
       text += '\n';
     });
+
+    if (top.length === 0) {
+      text += '(Tidak ada hasil ditemukan)\n';
+    }
 
     console.log(`[SEARCH] Found ${top.length} results for: ${query}`);
     return { type: 'search', query, results: top, text, resultCount: top.length };
