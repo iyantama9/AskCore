@@ -129,6 +129,18 @@ class ApiService {
     }
   }
 
+  // Search across chats
+  Future<List<Map<String, dynamic>>> searchChats(String query) async {
+    final response = await http.get(
+      Uri.parse('${AppConstants.backendUrl}/api/chats/search?q=${Uri.encodeComponent(query)}'),
+      headers: _authHeaders,
+    );
+    if (response.statusCode == 200) {
+      return List<Map<String, dynamic>>.from(jsonDecode(response.body));
+    }
+    throw ApiException('Search failed');
+  }
+
   // Messages
   Future<List<Map<String, dynamic>>> getMessages(int chatId) async {
     final response = await http.get(
@@ -174,6 +186,105 @@ class ApiService {
     throw ApiException(error['error'] ?? 'Failed to send message');
   }
 
+  // Edit message
+  Future<Map<String, dynamic>> editMessage(int chatId, int messageId, String content) async {
+    final response = await http.put(
+      Uri.parse('${AppConstants.backendUrl}/api/chats/$chatId/messages/$messageId'),
+      headers: _authHeaders,
+      body: jsonEncode({'content': content}),
+    );
+    if (response.statusCode == 200) {
+      return jsonDecode(response.body);
+    }
+    throw ApiException('Failed to edit message');
+  }
+
+  /// Send message with SSE streaming (real-time token delivery)
+  /// Falls back to non-streaming if browse tools are active
+  Stream<SseEvent> sendMessageStream(
+    int chatId,
+    String content, {
+    List<PendingFile>? files,
+    List<String>? tools,
+  }) async* {
+    final hasBrowse = tools?.contains('browse_web') ?? false;
+
+    // Browse mode doesn't support streaming — fall back to regular
+    if (hasBrowse) {
+      final result = await sendMessage(chatId, content, files: files, tools: tools);
+      final aiContent = result['message']?['content'] ?? '';
+      yield SseEvent.token(aiContent);
+      yield SseEvent.done(result);
+      return;
+    }
+
+    final body = <String, dynamic>{
+      'content': content,
+      'stream': true,
+    };
+
+    if (files != null && files.isNotEmpty) {
+      body['file_urls'] = files.map((f) => f.url).toList();
+      body['file_names'] = files.map((f) => f.name).toList();
+      body['file_url'] = files.first.url;
+      body['file_name'] = files.first.name;
+    }
+
+    if (tools != null && tools.isNotEmpty) {
+      body['tools'] = tools;
+    }
+
+    final request = http.Request(
+      'POST',
+      Uri.parse('${AppConstants.backendUrl}/api/chats/$chatId/messages'),
+    );
+    request.headers.addAll(_authHeaders);
+    request.body = jsonEncode(body);
+
+    final client = http.Client();
+    try {
+      final streamedResponse = await client.send(request);
+
+      if (streamedResponse.statusCode != 200) {
+        final respBody = await streamedResponse.stream.bytesToString();
+        try {
+          final error = jsonDecode(respBody);
+          yield SseEvent.error(error['error'] ?? 'Stream failed');
+        } catch (_) {
+          yield SseEvent.error('Stream failed: ${streamedResponse.statusCode}');
+        }
+        return;
+      }
+
+      String buffer = '';
+      await for (final chunk in streamedResponse.stream.transform(utf8.decoder)) {
+        buffer += chunk;
+        while (buffer.contains('\n\n')) {
+          final idx = buffer.indexOf('\n\n');
+          final line = buffer.substring(0, idx).trim();
+          buffer = buffer.substring(idx + 2);
+
+          if (!line.startsWith('data: ')) continue;
+          final data = line.substring(6).trim();
+          if (data == '[DONE]') continue;
+
+          try {
+            final parsed = jsonDecode(data);
+            if (parsed['error'] != null) {
+              yield SseEvent.error(parsed['error']);
+            } else if (parsed['token'] != null) {
+              yield SseEvent.token(parsed['token']);
+            } else if (parsed['done'] == true) {
+              yield SseEvent.done(parsed);
+            }
+          } catch (_) {}
+        }
+      }
+    } finally {
+      client.close();
+    }
+  }
+
   // Upload
   Future<Map<String, dynamic>> uploadFile(
     List<int> bytes,
@@ -212,4 +323,22 @@ class ApiException implements Exception {
 
   @override
   String toString() => message;
+}
+
+enum SseEventType { token, done, error }
+
+class SseEvent {
+  final SseEventType type;
+  final String? token;
+  final Map<String, dynamic>? metadata;
+  final String? error;
+
+  const SseEvent._({required this.type, this.token, this.metadata, this.error});
+
+  factory SseEvent.token(String token) =>
+      SseEvent._(type: SseEventType.token, token: token);
+  factory SseEvent.done(Map<String, dynamic> meta) =>
+      SseEvent._(type: SseEventType.done, metadata: meta);
+  factory SseEvent.error(String err) =>
+      SseEvent._(type: SseEventType.error, error: err);
 }

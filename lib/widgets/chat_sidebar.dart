@@ -30,11 +30,34 @@ class ChatSidebar extends StatefulWidget {
 class _ChatSidebarState extends State<ChatSidebar> {
   int? _editingId;
   final _editController = TextEditingController();
+  final _searchController = TextEditingController();
+  String _searchQuery = '';
+  List<Map<String, dynamic>>? _searchResults;
+  bool _isSearching = false;
 
   @override
   void dispose() {
     _editController.dispose();
+    _searchController.dispose();
     super.dispose();
+  }
+
+  void _onSearchChanged(String query) async {
+    setState(() => _searchQuery = query);
+    if (query.trim().length >= 3) {
+      setState(() => _isSearching = true);
+      try {
+        final results = await ApiService().searchChats(query.trim());
+        if (mounted) setState(() {
+          _searchResults = results;
+          _isSearching = false;
+        });
+      } catch (_) {
+        if (mounted) setState(() => _isSearching = false);
+      }
+    } else {
+      setState(() => _searchResults = null);
+    }
   }
 
   void _startEditing(int chatId, String currentTitle) {
@@ -82,27 +105,80 @@ class _ChatSidebarState extends State<ChatSidebar> {
             ),
           ),
           const SizedBox(height: 4),
+          // Search bar
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+            child: TextField(
+              controller: _searchController,
+              onChanged: _onSearchChanged,
+              decoration: InputDecoration(
+                hintText: 'Search chats...',
+                prefixIcon: const Icon(Icons.search_rounded, size: 18),
+                suffixIcon: _searchQuery.isNotEmpty
+                    ? IconButton(
+                        icon: const Icon(Icons.close_rounded, size: 16),
+                        onPressed: () {
+                          _searchController.clear();
+                          _onSearchChanged('');
+                        },
+                      )
+                    : null,
+                isDense: true,
+                contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(10),
+                  borderSide: BorderSide(color: theme.colorScheme.outline.withValues(alpha: 0.2)),
+                ),
+                enabledBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(10),
+                  borderSide: BorderSide(color: theme.colorScheme.outline.withValues(alpha: 0.2)),
+                ),
+                filled: true,
+                fillColor: theme.colorScheme.surface,
+              ),
+              style: theme.textTheme.bodySmall,
+            ),
+          ),
+          const SizedBox(height: 4),
           // Chat list
           Expanded(
-            child: widget.chats.isEmpty
-                ? Center(
+            child: Builder(builder: (context) {
+              // Apply filter
+              final displayChats = _searchQuery.isNotEmpty && _searchResults != null
+                  ? _searchResults!
+                  : _searchQuery.isNotEmpty
+                      ? widget.chats.where((c) {
+                          final title = (c['title'] ?? '').toString().toLowerCase();
+                          return title.contains(_searchQuery.toLowerCase());
+                        }).toList()
+                      : widget.chats;
+
+              if (_isSearching) {
+                return const Center(child: CircularProgressIndicator(strokeWidth: 2));
+              }
+
+              if (displayChats.isEmpty) {
+                return Center(
                     child: Padding(
                       padding: const EdgeInsets.all(24),
                       child: Text(
-                        'No chats yet.\nTap "New Chat" to start!',
+                        _searchQuery.isNotEmpty
+                            ? 'No results found'
+                            : 'No chats yet.\nTap "New Chat" to start!',
                         textAlign: TextAlign.center,
                         style: theme.textTheme.bodyMedium?.copyWith(
                           color: theme.colorScheme.onSurfaceVariant,
                         ),
                       ),
                     ),
-                  )
-                : ListView.builder(
+                  );
+              }
+              return ListView.builder(
                     padding: const EdgeInsets.symmetric(
                         horizontal: 8, vertical: 4),
-                    itemCount: widget.chats.length,
+                    itemCount: displayChats.length,
                     itemBuilder: (context, index) {
-                      final chat = widget.chats[index];
+                      final chat = displayChats[index];
                       final chatId = chat['id'] as int;
                       final isSelected = chatId == widget.selectedChatId;
                       final isEditing = _editingId == chatId;
@@ -216,7 +292,8 @@ class _ChatSidebarState extends State<ChatSidebar> {
                         ),
                       );
                     },
-                  ),
+                  );
+            }),
           ),
           // User info + logout
           Container(

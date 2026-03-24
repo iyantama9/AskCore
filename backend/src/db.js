@@ -36,6 +36,12 @@ async function initDB() {
         created_at TIMESTAMPTZ DEFAULT NOW()
       );
     `);
+
+    // Performance indexes
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_messages_chat_id ON messages(chat_id);
+      CREATE INDEX IF NOT EXISTS idx_chats_user_id_updated ON chats(user_id, updated_at DESC);
+    `);
     console.log('✅ Database tables ready');
   } finally {
     client.release();

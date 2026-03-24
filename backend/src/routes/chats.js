@@ -76,4 +76,28 @@ router.delete('/:id', async (req, res) => {
   }
 });
 
+// Search across chats
+router.get('/search', async (req, res) => {
+  const { q } = req.query;
+  if (!q || q.trim().length < 2) {
+    return res.status(400).json({ error: 'Query too short' });
+  }
+  try {
+    const result = await pool.query(
+      `SELECT DISTINCT c.id, c.title, c.model, c.updated_at,
+              (SELECT content FROM messages WHERE chat_id = c.id AND content ILIKE $2 ORDER BY created_at DESC LIMIT 1) as matched_content
+       FROM chats c
+       LEFT JOIN messages m ON m.chat_id = c.id
+       WHERE c.user_id = $1 AND (c.title ILIKE $2 OR m.content ILIKE $2)
+       ORDER BY c.updated_at DESC
+       LIMIT 20`,
+      [req.userId, `%${q.trim()}%`]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Search error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 module.exports = router;

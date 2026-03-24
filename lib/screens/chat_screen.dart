@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import '../helpers/clipboard_paste.dart';
 import '../core/constants.dart';
 import '../main.dart';
@@ -262,40 +263,89 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
     });
     _scrollToBottom();
 
+    final toolsList = _activeTools
+        .map((t) => t == ChatTool.browseWeb ? 'browse_web' : 'create_image')
+        .toList();
+    final pendingFilesCopy = List<PendingFile>.from(_pendingFiles);
+
     try {
-      final result = await _api.sendMessage(
+      String accumulated = '';
+      bool firstToken = true;
+      final idx = _messages.indexWhere((m) => m.id == thinkingMsg.id);
+
+      await for (final event in _api.sendMessageStream(
         _selectedChatId!,
         content,
-        files: _pendingFiles,
-        tools: _activeTools.map((t) => t == ChatTool.browseWeb ? 'browse_web' : 'create_image').toList(),
-      );
+        files: pendingFilesCopy,
+        tools: toolsList,
+      )) {
+        if (!mounted) break;
 
-      final aiContent = result['message']?['content'] ?? 'No response';
+        switch (event.type) {
+          case SseEventType.token:
+            accumulated += event.token ?? '';
+            if (firstToken && idx != -1) {
+              firstToken = false;
+              setState(() {
+                _messages[idx] = ChatMessage(
+                  id: thinkingMsg.id,
+                  role: MessageRole.assistant,
+                  content: accumulated,
+                  timestamp: DateTime.now(),
+                  isLoading: false,
+                  isThinking: false,
+                  isTyping: false,
+                  revealedChars: accumulated.length,
+                );
+                _pendingFiles = [];
+              });
+            } else if (idx != -1) {
+              setState(() {
+                _messages[idx] = _messages[idx].copyWith(
+                  content: accumulated,
+                  revealedChars: accumulated.length,
+                );
+              });
+            }
+            _scrollToBottom();
+            break;
 
-      final aiMsg = ChatMessage(
-        id: thinkingMsg.id,
-        role: MessageRole.assistant,
-        content: aiContent,
-        timestamp: DateTime.now(),
-        isLoading: true,
-        isThinking: false,
-        isTyping: true,
-        revealedChars: 0,
-      );
+          case SseEventType.done:
+            if (idx != -1) {
+              setState(() {
+                _messages[idx] = _messages[idx].copyWith(
+                  content: accumulated,
+                  isLoading: false,
+                  isTyping: false,
+                  revealedChars: accumulated.length,
+                );
+                _isLoading = false;
+              });
+            }
+            if (event.metadata?['chat_title_updated'] == true) {
+              await _loadChats();
+            }
+            break;
 
-      final idx = _messages.indexWhere((m) => m.id == thinkingMsg.id);
-      if (idx != -1) {
-        setState(() {
-          _messages[idx] = aiMsg;
-          _isLoading = false;
-          _pendingFiles = [];
-          _typingIndex = idx;
-        });
-        _startTypewriter(idx, aiContent);
+          case SseEventType.error:
+            if (idx != -1) {
+              setState(() {
+                _messages[idx] = ChatMessage(
+                  id: thinkingMsg.id,
+                  role: MessageRole.assistant,
+                  content: '⚠️ ${event.error}',
+                  timestamp: DateTime.now(),
+                );
+                _isLoading = false;
+              });
+            }
+            break;
+        }
       }
 
-      if (result['chat_title_updated'] == true) {
-        await _loadChats();
+      // Ensure loading is cleared
+      if (mounted) {
+        setState(() => _isLoading = false);
       }
     } catch (e) {
       final errMsg = ChatMessage(
@@ -494,30 +544,41 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
     );
 
     if (isDesktop) {
-      return Scaffold(
-        body: Row(
-          children: [
-            AnimatedContainer(
-              duration: const Duration(milliseconds: 250),
-              curve: Curves.easeInOutCubic,
-              width: _sidebarOpen ? AppConstants.sidebarWidth : 0,
-              child: _sidebarOpen
-                  ? AnimatedOpacity(
-                      duration: const Duration(milliseconds: 200),
-                      opacity: 1.0,
-                      child: sidebar,
-                    )
-                  : const SizedBox.shrink(),
+      return CallbackShortcuts(
+        bindings: {
+          const SingleActivator(LogicalKeyboardKey.keyN, control: true): _createNewChat,
+          const SingleActivator(LogicalKeyboardKey.keyS, control: true, shift: true): () {
+            setState(() => _sidebarOpen = !_sidebarOpen);
+          },
+        },
+        child: Focus(
+          autofocus: true,
+          child: Scaffold(
+            body: Row(
+              children: [
+                AnimatedContainer(
+                  duration: const Duration(milliseconds: 250),
+                  curve: Curves.easeInOutCubic,
+                  width: _sidebarOpen ? AppConstants.sidebarWidth : 0,
+                  child: _sidebarOpen
+                      ? AnimatedOpacity(
+                          duration: const Duration(milliseconds: 200),
+                          opacity: 1.0,
+                          child: sidebar,
+                        )
+                      : const SizedBox.shrink(),
+                ),
+                if (_sidebarOpen)
+                  VerticalDivider(
+                    width: 1,
+                    color: theme.colorScheme.outline.withValues(alpha: 0.15),
+                  ),
+                Expanded(
+                  child: Scaffold(appBar: appBar, body: chatBody),
+                ),
+              ],
             ),
-            if (_sidebarOpen)
-              VerticalDivider(
-                width: 1,
-                color: theme.colorScheme.outline.withValues(alpha: 0.15),
-              ),
-            Expanded(
-              child: Scaffold(appBar: appBar, body: chatBody),
-            ),
-          ],
+          ),
         ),
       );
     } else {

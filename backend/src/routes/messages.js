@@ -1,9 +1,20 @@
 const express = require('express');
 const { pool } = require('../db');
 const authMiddleware = require('../middleware/auth');
+const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
 
 const router = express.Router();
 router.use(authMiddleware);
+
+// S3/R2 singleton client
+const s3Client = new S3Client({
+  region: 'auto',
+  endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+  credentials: {
+    accessKeyId: process.env.R2_ACCESS_KEY_ID,
+    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
+  },
+});
 
 // --- Browse helpers ---
 
@@ -203,14 +214,8 @@ async function executeBrowseCommand(cmd, req) {
 
   // Screenshot
   const screenshotBuffer = await page.screenshot({ type: 'jpeg', quality: 60 });
-  const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
-  const s3 = new S3Client({
-    region: 'auto',
-    endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
-    credentials: { accessKeyId: process.env.R2_ACCESS_KEY_ID, secretAccessKey: process.env.R2_SECRET_ACCESS_KEY },
-  });
   const key = `browse/${req.userId}/${Date.now()}.jpg`;
-  await s3.send(new PutObjectCommand({
+  await s3Client.send(new PutObjectCommand({
     Bucket: process.env.R2_BUCKET_NAME, Key: key, Body: screenshotBuffer, ContentType: 'image/jpeg',
   }));
   const proto = req.get('x-forwarded-proto') || req.protocol;
@@ -309,6 +314,34 @@ router.get('/:chatId/messages', async (req, res) => {
   }
 });
 
+// Edit message
+router.put('/:chatId/messages/:messageId', async (req, res) => {
+  const { content } = req.body;
+  if (!content || !content.trim()) {
+    return res.status(400).json({ error: 'Content required' });
+  }
+  try {
+    const chat = await pool.query(
+      'SELECT id FROM chats WHERE id = $1 AND user_id = $2',
+      [req.params.chatId, req.userId]
+    );
+    if (chat.rows.length === 0) {
+      return res.status(404).json({ error: 'Chat not found' });
+    }
+    const result = await pool.query(
+      `UPDATE messages SET content = $1 WHERE id = $2 AND chat_id = $3 AND role = 'user' RETURNING *`,
+      [content.trim(), req.params.messageId, req.params.chatId]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Message not found or not editable' });
+    }
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Edit message error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // Send message + get AI response
 router.post('/:chatId/messages', async (req, res) => {
   const { content, file_url, file_name, file_urls, file_names, tools } = req.body;
@@ -347,26 +380,14 @@ router.post('/:chatId/messages', async (req, res) => {
       [req.params.chatId]
     );
 
-    // Build messages array with system prompt
-    const allMessages = history.rows.map((m) => ({ role: m.role, content: m.content }));
-
-    // Helper: get S3 client
-    const getS3 = () => {
-      const { S3Client } = require('@aws-sdk/client-s3');
-      return new S3Client({
-        region: 'auto',
-        endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
-        credentials: {
-          accessKeyId: process.env.R2_ACCESS_KEY_ID,
-          secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
-        },
-      });
-    };
+    // Build messages array with system prompt (cap at 30 messages for context window)
+    const historyRows = history.rows;
+    const cappedHistory = historyRows.length > 30 ? historyRows.slice(-30) : historyRows;
+    const allMessages = cappedHistory.map((m) => ({ role: m.role, content: m.content }));
 
     // Helper: read file from R2 as buffer
     const readFileFromR2 = async (key) => {
-      const { GetObjectCommand } = require('@aws-sdk/client-s3');
-      const obj = await getS3().send(new GetObjectCommand({
+      const obj = await s3Client.send(new GetObjectCommand({
         Bucket: process.env.R2_BUCKET_NAME,
         Key: key,
       }));
@@ -455,7 +476,108 @@ router.post('/:chatId/messages', async (req, res) => {
       ...allMessages,
     ];
 
-    // Call AI API
+    const useStream = req.body.stream === true && (!tools || !tools.includes('browse_web'));
+
+    // === SSE STREAMING MODE (non-browse only) ===
+    if (useStream) {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
+      res.flushHeaders();
+
+      const aiResponse = await fetch(`${process.env.AI_BASE_URL}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${process.env.AI_API_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ model, messages, stream: true }),
+      });
+
+      if (!aiResponse.ok) {
+        const errData = await aiResponse.json().catch(() => ({}));
+        res.write(`data: ${JSON.stringify({ error: errData.error?.message || 'AI API error' })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        return res.end();
+      }
+
+      let fullContent = '';
+      const reader = aiResponse.body;
+
+      // Handle image generation model — images come in non-standard format
+      const isImageModel = model && model.includes('image');
+
+      for await (const chunk of reader) {
+        const text = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf-8');
+        const lines = text.split('\n').filter(l => l.startsWith('data: '));
+
+        for (const line of lines) {
+          const data = line.slice(6).trim();
+          if (data === '[DONE]') continue;
+
+          try {
+            const parsed = JSON.parse(data);
+            const delta = parsed.choices?.[0]?.delta?.content || '';
+            if (delta) {
+              fullContent += delta;
+              res.write(`data: ${JSON.stringify({ token: delta })}\n\n`);
+            }
+
+            // Check for images (image generation models)
+            const images = parsed.choices?.[0]?.message?.images || parsed.choices?.[0]?.delta?.images;
+            if (images && Array.isArray(images) && images.length > 0) {
+              res.write(`data: ${JSON.stringify({ images })}\n\n`);
+            }
+          } catch {}
+        }
+      }
+
+      // Save AI response to DB
+      const saved = await pool.query(
+        `INSERT INTO messages (chat_id, role, content) VALUES ($1, 'assistant', $2) RETURNING *`,
+        [req.params.chatId, fullContent]
+      );
+
+      // Auto-title on first message
+      const msgCount = await pool.query(
+        'SELECT COUNT(*) FROM messages WHERE chat_id = $1', [req.params.chatId]
+      );
+      const chatTitleUpdated = parseInt(msgCount.rows[0].count) <= 2;
+
+      if (chatTitleUpdated) {
+        try {
+          const titleResponse = await fetch(`${process.env.AI_BASE_URL}/chat/completions`, {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${process.env.AI_API_KEY}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              model: 'gemini-2.5-flash-lite',
+              messages: [{ role: 'user', content: `Buatkan judul singkat (maksimal 5 kata, tanpa tanda kutip) untuk percakapan yang dimulai dengan pesan ini: "${content}"` }],
+              stream: false,
+            }),
+          });
+          if (titleResponse.ok) {
+            const titleData = await titleResponse.json();
+            const title = titleData.choices?.[0]?.message?.content?.trim().slice(0, 100) || content.slice(0, 50);
+            await pool.query('UPDATE chats SET title = $1, updated_at = NOW() WHERE id = $2', [title, req.params.chatId]);
+          }
+        } catch {
+          await pool.query('UPDATE chats SET title = $1, updated_at = NOW() WHERE id = $2', [content.slice(0, 50), req.params.chatId]);
+        }
+      } else {
+        await pool.query('UPDATE chats SET updated_at = NOW() WHERE id = $1', [req.params.chatId]);
+      }
+
+      // Send final metadata
+      res.write(`data: ${JSON.stringify({ done: true, message: saved.rows[0], chat_title_updated: chatTitleUpdated })}\n\n`);
+      res.write('data: [DONE]\n\n');
+      return res.end();
+    }
+
+    // === NON-STREAMING MODE (browse + fallback) ===
     const aiResponse = await fetch(`${process.env.AI_BASE_URL}/chat/completions`, {
       method: 'POST',
       headers: {
