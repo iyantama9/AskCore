@@ -16,10 +16,10 @@ function parseBrowseCommands(text) {
     commands.push({ action: 'navigate', url: m[1].trim() });
   }
 
-  // [SEARCH:query] → Google search
+  // [SEARCH:query] → DuckDuckGo search (Google blocks VPS IPs with CAPTCHA)
   const searchMatches = text.matchAll(/\[SEARCH:([^\]]+)\]/gi);
   for (const m of searchMatches) {
-    commands.push({ action: 'navigate', url: `https://www.google.com/search?q=${encodeURIComponent(m[1].trim())}` });
+    commands.push({ action: 'navigate', url: `https://html.duckduckgo.com/html/?q=${encodeURIComponent(m[1].trim())}` });
   }
 
   // [CLICK:selector]
@@ -175,7 +175,7 @@ const getSystemPrompt = (model, tools = []) => {
 Ketika user meminta informasi dari internet, kamu WAJIB memulai jawaban dengan perintah browsing. JANGAN menjawab dari pengetahuan saja — SELALU cari dulu di internet.
 
 Perintah yang tersedia:
-- [SEARCH:query] — cari di Google (UTAMAKAN ini untuk mencari informasi)
+- [SEARCH:query] — cari di internet via DuckDuckGo (UTAMAKAN ini untuk mencari informasi)
 - [BROWSE:url] — buka URL spesifik
 - [CLICK:css_selector] — klik elemen
 - [TYPE:css_selector|teks] — ketik teks di input field
