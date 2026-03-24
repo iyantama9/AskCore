@@ -254,7 +254,10 @@ class _MessageBubbleState extends State<MessageBubble> {
               borderRadius: BorderRadius.circular(20),
               child: InkWell(
                 borderRadius: BorderRadius.circular(20),
-                onTap: () => launchUrl(uri, mode: LaunchMode.externalApplication),
+                onTap: () => launchUrl(
+                  Uri.parse(imageUrl),
+                  mode: LaunchMode.externalApplication,
+                ),
                 child: const Padding(
                   padding: EdgeInsets.all(8),
                   child: Icon(Icons.download_rounded,

@@ -6,6 +6,72 @@ const router = express.Router();
 router.use(authMiddleware);
 
 // --- Browse helpers ---
+
+// Direct HTTP search via DuckDuckGo Lite (no Puppeteer = no CAPTCHA)
+async function executeSearch(query) {
+  try {
+    const url = `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}`;
+    const resp = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+        'Accept': 'text/html',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
+    });
+    const html = await resp.text();
+
+    // Parse search results from DuckDuckGo Lite HTML
+    const results = [];
+    // DuckDuckGo Lite uses <a> tags with class="result-link" or simple <a href> in result rows
+    const linkRegex = /<a[^>]+rel="nofollow"[^>]+href="([^"]+)"[^>]*>([^<]+)<\/a>/gi;
+    const snippetRegex = /<td[^>]*class="result-snippet"[^>]*>([\s\S]*?)<\/td>/gi;
+
+    let match;
+    while ((match = linkRegex.exec(html)) !== null) {
+      const href = match[1];
+      const title = match[2].replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#x27;/g, "'").trim();
+      if (href.startsWith('http') && !href.includes('duckduckgo.com')) {
+        results.push({ title, url: href, snippet: '' });
+      }
+    }
+
+    // Try to get snippets
+    let snippetMatch;
+    let idx = 0;
+    while ((snippetMatch = snippetRegex.exec(html)) !== null && idx < results.length) {
+      results[idx].snippet = snippetMatch[1].replace(/<[^>]+>/g, '').replace(/&amp;/g, '&').trim().substring(0, 200);
+      idx++;
+    }
+
+    // Format results as text for AI
+    if (results.length === 0) {
+      // Fallback: extract any <a href> links from the page
+      const fallbackRegex = /<a[^>]+href="(https?:\/\/[^"]+)"[^>]*>([^<]+)<\/a>/gi;
+      while ((match = fallbackRegex.exec(html)) !== null && results.length < 10) {
+        const href = match[1];
+        const title = match[2].trim();
+        if (!href.includes('duckduckgo.com') && title.length > 5) {
+          results.push({ title, url: href, snippet: '' });
+        }
+      }
+    }
+
+    const top = results.slice(0, 10);
+    let text = `Hasil pencarian untuk "${query}":\n\n`;
+    top.forEach((r, i) => {
+      text += `${i + 1}. ${r.title}\n   URL: ${r.url}\n`;
+      if (r.snippet) text += `   ${r.snippet}\n`;
+      text += '\n';
+    });
+
+    console.log(`[SEARCH] Found ${top.length} results for: ${query}`);
+    return { type: 'search', query, results: top, text, resultCount: top.length };
+  } catch (err) {
+    console.error('[SEARCH ERROR]', err.message);
+    return { type: 'search', query, results: [], text: `Pencarian gagal: ${err.message}`, resultCount: 0 };
+  }
+}
+
 function parseBrowseCommands(text) {
   const commands = [];
   if (!text) return commands;
@@ -16,10 +82,10 @@ function parseBrowseCommands(text) {
     commands.push({ action: 'navigate', url: m[1].trim() });
   }
 
-  // [SEARCH:query] → DuckDuckGo search (Google blocks VPS IPs with CAPTCHA)
+  // [SEARCH:query] → Uses direct HTTP fetch (no Puppeteer)
   const searchMatches = text.matchAll(/\[SEARCH:([^\]]+)\]/gi);
   for (const m of searchMatches) {
-    commands.push({ action: 'navigate', url: `https://html.duckduckgo.com/html/?q=${encodeURIComponent(m[1].trim())}` });
+    commands.push({ action: 'search', query: m[1].trim() });
   }
 
   // [CLICK:selector]
@@ -62,7 +128,10 @@ async function getSharedBrowser() {
     return sharedBrowser;
   }
 
-  const puppeteer = require('puppeteer');
+  const puppeteer = require('puppeteer-extra');
+  const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+  puppeteer.use(StealthPlugin());
+
   sharedBrowser = await puppeteer.launch({
     headless: 'new',
     args: [
@@ -72,7 +141,7 @@ async function getSharedBrowser() {
     executablePath: process.env.CHROME_PATH || undefined,
   });
 
-  console.log('[BROWSE] Browser launched for agentic loop');
+  console.log('[BROWSE] Stealth browser launched');
   sharedIdleTimer = setTimeout(async () => {
     try { await sharedBrowser.close(); } catch(_) {}
     sharedBrowser = null;
@@ -85,6 +154,8 @@ async function executeBrowseCommand(cmd, req) {
   const browser = await getSharedBrowser();
   const pages = await browser.pages();
   let page = pages.length > 0 ? pages[pages.length - 1] : await browser.newPage();
+  // Set realistic user agent to bypass bot detection
+  await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36');
   await page.setViewport({ width: 1280, height: 800 });
 
   switch (cmd.action) {
@@ -175,7 +246,7 @@ const getSystemPrompt = (model, tools = []) => {
 Ketika user meminta informasi dari internet, kamu WAJIB memulai jawaban dengan perintah browsing. JANGAN menjawab dari pengetahuan saja — SELALU cari dulu di internet.
 
 Perintah yang tersedia:
-- [SEARCH:query] — cari di internet via DuckDuckGo (UTAMAKAN ini untuk mencari informasi)
+- [SEARCH:query] — cari di Google (UTAMAKAN ini untuk mencari informasi)
 - [BROWSE:url] — buka URL spesifik
 - [CLICK:css_selector] — klik elemen
 - [TYPE:css_selector|teks] — ketik teks di input field
@@ -407,10 +478,17 @@ router.post('/:chatId/messages', async (req, res) => {
         let browseResults = [];
         for (const cmd of commands) {
           try {
-            const browseResult = await executeBrowseCommand(cmd, req);
-            browseResults.push(browseResult);
-            if (browseResult.screenshot_url) {
-              browseScreenshots.push(browseResult.screenshot_url);
+            if (cmd.action === 'search') {
+              // Direct HTTP search - no Puppeteer needed
+              const searchResult = await executeSearch(cmd.query);
+              browseResults.push(searchResult);
+            } else {
+              // Puppeteer-based browsing
+              const browseResult = await executeBrowseCommand(cmd, req);
+              browseResults.push(browseResult);
+              if (browseResult.screenshot_url) {
+                browseScreenshots.push(browseResult.screenshot_url);
+              }
             }
           } catch (err) {
             browseResults.push({ error: err.message });
@@ -419,8 +497,16 @@ router.post('/:chatId/messages', async (req, res) => {
 
         // Build browse context for AI
         const browseContext = browseResults.map((r, i) => {
-          let ctx = `--- Hasil Browsing (Step ${step + 1}, Command ${i + 1}) ---\n`;
+          let ctx = `--- Hasil (Step ${step + 1}, Command ${i + 1}) ---\n`;
           if (r.error) return ctx + `Error: ${r.error}`;
+
+          // Search results (from HTTP fetch)
+          if (r.type === 'search') {
+            ctx += r.text;
+            return ctx;
+          }
+
+          // Browse results (from Puppeteer)
           ctx += `URL: ${r.current_url || 'unknown'}\n`;
           ctx += `Title: ${r.page_title || 'unknown'}\n`;
           if (r.text_content) ctx += `Konten halaman:\n${r.text_content}\n`;
