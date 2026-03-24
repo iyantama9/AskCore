@@ -484,6 +484,46 @@ router.post('/:chatId/messages', async (req, res) => {
       for (let step = 0; step < MAX_BROWSE_STEPS; step++) {
         // Parse browse commands from AI response
         const commands = parseBrowseCommands(currentResponse);
+
+        // FALLBACK: If AI model didn't emit any browse commands on first step,
+        // auto-search using the user's message (makes browse work across ALL models)
+        if (commands.length === 0 && step === 0) {
+          const userMessages = allMessages.filter(m => m.role === 'user');
+          const lastUserMsg = userMessages[userMessages.length - 1];
+          const userText = typeof lastUserMsg?.content === 'string'
+            ? lastUserMsg.content
+            : (Array.isArray(lastUserMsg?.content)
+                ? lastUserMsg.content.filter(c => c.type === 'text').map(c => c.text).join(' ')
+                : '');
+
+          if (userText && userText.length > 2) {
+            console.log('[BROWSE] AI skipped search, forcing fallback search for:', userText.substring(0, 80));
+            const searchResult = await executeSearch(userText.substring(0, 150));
+            if (searchResult.resultCount > 0) {
+              // Feed search results to AI and ask it to answer based on results
+              browseMessages.push({ role: 'assistant', content: currentResponse });
+              browseMessages.push({ role: 'user', content: `[Hasil pencarian otomatis]\n\n${searchResult.text}\n\nGunakan hasil pencarian di atas untuk menjawab pertanyaan sebelumnya dengan informasi terkini. Jika ingin membuka URL tertentu untuk detail lebih, gunakan [BROWSE:url].` });
+
+              const retryResponse = await fetch(`${process.env.AI_BASE_URL}/chat/completions`, {
+                method: 'POST',
+                headers: {
+                  Authorization: `Bearer ${process.env.AI_API_KEY}`,
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ model, messages: browseMessages, stream: false }),
+              });
+              if (retryResponse.ok) {
+                const retryData = await retryResponse.json();
+                currentResponse = retryData.choices?.[0]?.message?.content || currentResponse;
+                aiContent = currentResponse;
+                // Continue loop to check if AI now wants to browse further
+                continue;
+              }
+            }
+          }
+          break;
+        }
+
         if (commands.length === 0) break;
 
         console.log(`[BROWSE] Step ${step + 1}: ${commands.length} command(s)`);
