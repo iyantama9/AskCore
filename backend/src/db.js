@@ -1,51 +1,28 @@
 const { Pool } = require('pg');
+const logger = require('./utils/logger');
 require('dotenv').config();
+
+function getSslConfig() {
+  if (process.env.DATABASE_SSL === 'false') return false;
+
+  const rejectUnauthorized = process.env.DATABASE_SSL_REJECT_UNAUTHORIZED !== 'false';
+  const ssl = { rejectUnauthorized };
+
+  if (process.env.DATABASE_SSL_CA) {
+    ssl.ca = process.env.DATABASE_SSL_CA.replace(/\\n/g, '\n');
+  }
+
+  return ssl;
+}
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
+  ssl: getSslConfig(),
 });
 
 async function initDB() {
-  const client = await pool.connect();
-  try {
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS users (
-        id SERIAL PRIMARY KEY,
-        username VARCHAR(50) UNIQUE NOT NULL,
-        password_hash VARCHAR(255) NOT NULL,
-        created_at TIMESTAMPTZ DEFAULT NOW()
-      );
-
-      CREATE TABLE IF NOT EXISTS chats (
-        id SERIAL PRIMARY KEY,
-        user_id INT REFERENCES users(id) ON DELETE CASCADE,
-        title VARCHAR(255) DEFAULT 'New Chat',
-        model VARCHAR(100) DEFAULT 'gemini-2.5-flash-lite',
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        updated_at TIMESTAMPTZ DEFAULT NOW()
-      );
-
-      CREATE TABLE IF NOT EXISTS messages (
-        id SERIAL PRIMARY KEY,
-        chat_id INT REFERENCES chats(id) ON DELETE CASCADE,
-        role VARCHAR(20) NOT NULL,
-        content TEXT NOT NULL,
-        file_url TEXT,
-        file_name VARCHAR(255),
-        created_at TIMESTAMPTZ DEFAULT NOW()
-      );
-    `);
-
-    // Performance indexes
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_messages_chat_id ON messages(chat_id);
-      CREATE INDEX IF NOT EXISTS idx_chats_user_id_updated ON chats(user_id, updated_at DESC);
-    `);
-    console.log('✅ Database tables ready');
-  } finally {
-    client.release();
-  }
+  await pool.query('SELECT 1');
+  logger.info('database_connection_ready');
 }
 
-module.exports = { pool, initDB };
+module.exports = { pool, initDB, getSslConfig };

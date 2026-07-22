@@ -1,10 +1,15 @@
 const express = require('express');
 const authMiddleware = require('../middleware/auth');
+const { validatePublicHttpUrl } = require('../utils/urlSafety');
+const { sendError } = require('../utils/errors');
+const { assertQuota, recordUsage } = require('../utils/usage');
+const logger = require('../utils/logger');
+const metrics = require('../utils/metrics');
 
 const router = express.Router();
 router.use(authMiddleware);
 
-// Shared browser instance (singleton to save RAM)
+// Shared browser process only; page/context is isolated per request.
 let browserInstance = null;
 let browserIdleTimer = null;
 const BROWSER_IDLE_TIMEOUT = 120000; // 2 minutes
@@ -33,9 +38,25 @@ async function getBrowser() {
     executablePath: process.env.CHROME_PATH || undefined,
   });
 
-  console.log('[BROWSE] Browser launched');
+  logger.info('browse_browser_launched');
   resetIdleTimer();
   return browserInstance;
+}
+
+async function createIsolatedContext(browser) {
+  if (typeof browser.createBrowserContext === 'function') {
+    return browser.createBrowserContext();
+  }
+  if (typeof browser.createIncognitoBrowserContext === 'function') {
+    return browser.createIncognitoBrowserContext();
+  }
+  return browser;
+}
+
+async function closeContext(context) {
+  if (context && typeof context.close === 'function') {
+    await context.close().catch(() => {});
+  }
 }
 
 function resetIdleTimer() {
@@ -44,7 +65,7 @@ function resetIdleTimer() {
     if (browserInstance) {
       try {
         await browserInstance.close();
-        console.log('[BROWSE] Browser closed (idle timeout)');
+        logger.info('browse_browser_closed', { reason: 'idle_timeout' });
       } catch (_) {}
       browserInstance = null;
     }
@@ -56,24 +77,23 @@ router.post('/', async (req, res) => {
   const { url, action = 'navigate', selector, text, scroll_direction } = req.body;
 
   if (!url && action === 'navigate') {
-    return res.status(400).json({ error: 'URL required for navigate action' });
+    return sendError(res, req, 400, 'URL required for navigate action', null, 'URL_REQUIRED');
   }
 
+  let context;
   try {
+    await assertQuota(req.userId, 'browse_request', 1);
+    const safeNavigateUrl = action === 'navigate' ? await validatePublicHttpUrl(url) : null;
     const browser = await getBrowser();
-    const pages = await browser.pages();
-    let page = pages.length > 0 ? pages[pages.length - 1] : await browser.newPage();
+    context = await createIsolatedContext(browser);
+    const page = await context.newPage();
 
-    // Set viewport
     await page.setViewport({ width: 1280, height: 800 });
-
-    let result = {};
 
     switch (action) {
       case 'navigate': {
-        const targetUrl = url.startsWith('http') ? url : `https://${url}`;
-        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
-        await page.waitForTimeout(1000); // Let page render
+        await page.goto(safeNavigateUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+        await page.waitForTimeout(1000);
         break;
       }
       case 'click': {
@@ -103,14 +123,12 @@ router.post('/', async (req, res) => {
       }
     }
 
-    // Take screenshot
     const screenshotBuffer = await page.screenshot({
       type: 'jpeg',
       quality: 60,
       fullPage: false,
     });
 
-    // Upload screenshot to R2
     const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
     const s3 = new S3Client({
       region: 'auto',
@@ -129,34 +147,25 @@ router.post('/', async (req, res) => {
       ContentType: 'image/jpeg',
     }));
 
-    const proto = req.get('x-forwarded-proto') || req.protocol;
-    const host = req.get('x-forwarded-host') || req.get('host');
-    const screenshotUrl = `${proto}://${host}/api/files/${key}`;
-
-    // Extract page info
+    const screenshotUrl = `${process.env.PUBLIC_BASE_URL || 'https://askcore.dev'}/api/files/${key}`;
     const pageTitle = await page.title();
     const currentUrl = page.url();
 
-    // Extract visible text (limited to first 3000 chars)
     const pageText = await page.evaluate(() => {
       const body = document.body;
       if (!body) return '';
-      // Remove scripts and styles
       const clone = body.cloneNode(true);
       clone.querySelectorAll('script, style, noscript, svg').forEach(el => el.remove());
       return clone.innerText?.substring(0, 3000) || '';
     });
 
-    // Extract interactive elements (links, buttons, inputs)
     const elements = await page.evaluate(() => {
       const items = [];
-      // Links
       document.querySelectorAll('a[href]').forEach((el, i) => {
         if (i < 10 && el.innerText?.trim()) {
           items.push({ type: 'link', text: el.innerText.trim().substring(0, 80), href: el.href });
         }
       });
-      // Inputs
       document.querySelectorAll('input, textarea').forEach((el, i) => {
         if (i < 5) {
           items.push({
@@ -166,7 +175,6 @@ router.post('/', async (req, res) => {
           });
         }
       });
-      // Buttons
       document.querySelectorAll('button, [role="button"]').forEach((el, i) => {
         if (i < 5 && el.innerText?.trim()) {
           items.push({ type: 'button', text: el.innerText.trim().substring(0, 50) });
@@ -175,18 +183,21 @@ router.post('/', async (req, res) => {
       return items;
     });
 
-    result = {
+    await recordUsage(req.userId, 'browse_request', 1, { action, url: safeNavigateUrl });
+
+    res.json({
       screenshot_url: screenshotUrl,
       page_title: pageTitle,
       current_url: currentUrl,
       text_content: pageText,
-      elements: elements,
-    };
-
-    res.json(result);
+      elements,
+    });
   } catch (err) {
-    console.error('[BROWSE ERROR]', err.message);
-    res.status(500).json({ error: `Browse failed: ${err.message}` });
+    metrics.inc('browse_failures_total', { action, code: err.code || 'BROWSE_FAILED' });
+    const status = /private|localhost|http\/https|resolve/i.test(err.message || '') ? 400 : 500;
+    return sendError(res, req, status, 'Browse failed', err);
+  } finally {
+    await closeContext(context);
   }
 });
 

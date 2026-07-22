@@ -1,8 +1,6 @@
-import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:file_picker/file_picker.dart';
-import 'package:flutter/foundation.dart' show kIsWeb;
 import '../core/constants.dart';
 import '../services/api_service.dart';
 
@@ -14,10 +12,7 @@ class PendingFile {
 }
 
 /// Available tools
-enum ChatTool {
-  browseWeb,
-  createImage,
-}
+enum ChatTool { browseWeb, createImage, reasoning }
 
 class ChatInput extends StatefulWidget {
   final ValueChanged<String> onSend;
@@ -28,6 +23,8 @@ class ChatInput extends StatefulWidget {
   final List<PendingFile> attachedFiles;
   final Set<ChatTool> activeTools;
   final ValueChanged<ChatTool>? onToolToggled;
+  final bool supportsReasoning;
+  final bool currentModelSupportsVision;
 
   const ChatInput({
     super.key,
@@ -39,6 +36,8 @@ class ChatInput extends StatefulWidget {
     this.attachedFiles = const [],
     this.activeTools = const {},
     this.onToolToggled,
+    this.supportsReasoning = false,
+    this.currentModelSupportsVision = true,
   });
 
   @override
@@ -56,17 +55,70 @@ class _ChatInputState extends State<ChatInput>
   static const int maxFiles = 5;
 
   static const List<String> _allowedExtensions = [
-    'jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg',
-    'dart', 'js', 'ts', 'jsx', 'tsx', 'py', 'java', 'kt', 'swift',
-    'c', 'cpp', 'h', 'hpp', 'cs', 'go', 'rs', 'rb', 'php',
-    'html', 'css', 'scss', 'sass', 'less',
-    'json', 'yaml', 'yml', 'xml', 'toml', 'ini', 'env',
-    'sql', 'sh', 'bash', 'bat', 'ps1', 'cmd',
-    'md', 'txt', 'log', 'csv',
-    'vue', 'svelte', 'astro',
-    'r', 'lua', 'perl', 'scala', 'clj', 'ex', 'exs', 'erl',
-    'dockerfile', 'makefile', 'cmake',
-    'pdf', 'ppt', 'pptx',
+    'jpg',
+    'jpeg',
+    'png',
+    'gif',
+    'webp',
+    'bmp',
+    'svg',
+    'dart',
+    'js',
+    'ts',
+    'jsx',
+    'tsx',
+    'py',
+    'java',
+    'kt',
+    'swift',
+    'c',
+    'cpp',
+    'h',
+    'hpp',
+    'cs',
+    'go',
+    'rs',
+    'rb',
+    'php',
+    'html',
+    'css',
+    'scss',
+    'sass',
+    'less',
+    'json',
+    'yaml',
+    'yml',
+    'xml',
+    'toml',
+    'ini',
+    'env',
+    'sql',
+    'sh',
+    'bash',
+    'bat',
+    'ps1',
+    'cmd',
+    'md',
+    'txt',
+    'log',
+    'csv',
+    'vue',
+    'svelte',
+    'astro',
+    'r',
+    'lua',
+    'perl',
+    'scala',
+    'clj',
+    'ex',
+    'exs',
+    'erl',
+    'dockerfile',
+    'makefile',
+    'cmake',
+    'pdf',
+    'ppt',
+    'pptx',
   ];
 
   @override
@@ -105,7 +157,11 @@ class _ChatInputState extends State<ChatInput>
 
   bool get _canAddMore => widget.attachedFiles.length < maxFiles;
 
-  Future<void> _uploadBytes(Uint8List bytes, String fileName, String contentType) async {
+  Future<void> _uploadBytes(
+    Uint8List bytes,
+    String fileName,
+    String contentType,
+  ) async {
     if (!_canAddMore) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -124,19 +180,41 @@ class _ChatInputState extends State<ChatInput>
       return;
     }
 
+    // Check if uploading image to non-vision model
+    final isImage = contentType.startsWith('image/');
+    if (isImage && !widget.currentModelSupportsVision) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              '⚠️ Model saat ini tidak support gambar. Gunakan Sonnet 4.5, Kimi K2.6, atau GLM 5.2.',
+            ),
+            duration: Duration(seconds: 5),
+          ),
+        );
+      }
+      return;
+    }
+
     setState(() => _isUploading = true);
 
     try {
-      final uploadResult = await ApiService().uploadFile(bytes, fileName, contentType);
-      widget.onFileAdded?.call(PendingFile(
-        url: uploadResult['url'] ?? '',
-        name: uploadResult['name'] ?? fileName,
-      ));
+      final uploadResult = await ApiService().uploadFile(
+        bytes,
+        fileName,
+        contentType,
+      );
+      widget.onFileAdded?.call(
+        PendingFile(
+          url: uploadResult['key'] ?? uploadResult['url'] ?? '',
+          name: uploadResult['file_name'] ?? uploadResult['name'] ?? fileName,
+        ),
+      );
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Upload gagal: $e')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Upload gagal: $e')));
       }
     } finally {
       if (mounted) setState(() => _isUploading = false);
@@ -145,7 +223,8 @@ class _ChatInputState extends State<ChatInput>
 
   Future<void> handlePastedImage(Uint8List bytes, String mimeType) async {
     final ext = mimeType.split('/').last;
-    final fileName = 'pasted_image_${DateTime.now().millisecondsSinceEpoch}.$ext';
+    final fileName =
+        'pasted_image_${DateTime.now().millisecondsSinceEpoch}.$ext';
     await _uploadBytes(bytes, fileName, mimeType);
   }
 
@@ -191,7 +270,9 @@ class _ChatInputState extends State<ChatInput>
       if (ext == 'gif') contentType = 'image/gif';
       if (ext == 'webp') contentType = 'image/webp';
       if (ext == 'pdf') contentType = 'application/pdf';
-      if (ext == 'ppt' || ext == 'pptx') contentType = 'application/vnd.ms-powerpoint';
+      if (ext == 'ppt' || ext == 'pptx') {
+        contentType = 'application/vnd.ms-powerpoint';
+      }
       if (ext == 'svg') contentType = 'image/svg+xml';
       if (['txt', 'md', 'log', 'csv'].contains(ext)) contentType = 'text/plain';
 
@@ -231,6 +312,14 @@ class _ChatInputState extends State<ChatInput>
           'Create Image',
           widget.activeTools.contains(ChatTool.createImage),
         ),
+        if (widget.supportsReasoning)
+          _buildToolMenuItem(
+            theme,
+            ChatTool.reasoning,
+            Icons.psychology_rounded,
+            'Reasoning',
+            widget.activeTools.contains(ChatTool.reasoning),
+          ),
       ],
     ).then((tool) {
       if (tool != null) {
@@ -331,7 +420,9 @@ class _ChatInputState extends State<ChatInput>
                       color: theme.inputDecorationTheme.fillColor,
                       borderRadius: BorderRadius.circular(24),
                       border: Border.all(
-                        color: theme.colorScheme.outline.withValues(alpha: 0.15),
+                        color: theme.colorScheme.outline.withValues(
+                          alpha: 0.15,
+                        ),
                       ),
                     ),
                     child: Row(
@@ -353,7 +444,9 @@ class _ChatInputState extends State<ChatInput>
                                   )
                                 : Badge(
                                     isLabelVisible: hasAttachments,
-                                    label: Text('${widget.attachedFiles.length}'),
+                                    label: Text(
+                                      '${widget.attachedFiles.length}',
+                                    ),
                                     child: Icon(
                                       Icons.add_rounded,
                                       size: 22,
@@ -461,8 +554,8 @@ class _ChatInputState extends State<ChatInput>
                                       height: 18,
                                       child: CircularProgressIndicator(
                                         strokeWidth: 2,
-                                        color: theme
-                                            .colorScheme.onSurfaceVariant,
+                                        color:
+                                            theme.colorScheme.onSurfaceVariant,
                                       ),
                                     )
                                   : Icon(
@@ -470,9 +563,8 @@ class _ChatInputState extends State<ChatInput>
                                       size: 20,
                                       color: _hasText
                                           ? Colors.white
-                                          : theme
-                                              .colorScheme.onSurfaceVariant
-                                              .withValues(alpha: 0.4),
+                                          : theme.colorScheme.onSurfaceVariant
+                                                .withValues(alpha: 0.4),
                                     ),
                               padding: EdgeInsets.zero,
                               constraints: const BoxConstraints(
@@ -501,32 +593,44 @@ class _ChatInputState extends State<ChatInput>
     if (widget.activeTools.contains(ChatTool.createImage)) {
       return 'Deskripsikan gambar yang mau dibuat...';
     }
+    if (widget.activeTools.contains(ChatTool.reasoning)) {
+      return 'Tanya dengan penalaran mendalam...';
+    }
     return 'Tanya apa saja...';
   }
 
   Widget _buildToolChip(ThemeData theme, ChatTool tool) {
-    final isWeb = tool == ChatTool.browseWeb;
+    final (icon, label, colors) = switch (tool) {
+      ChatTool.browseWeb => (
+        Icons.travel_explore_rounded,
+        'Browse Web',
+        [const Color(0xFF0EA5E9), const Color(0xFF06B6D4)],
+      ),
+      ChatTool.createImage => (
+        Icons.auto_awesome_rounded,
+        'Create Image',
+        [const Color(0xFFEC4899), const Color(0xFFF43F5E)],
+      ),
+      ChatTool.reasoning => (
+        Icons.psychology_rounded,
+        'Reasoning',
+        [const Color(0xFF7C3AED), const Color(0xFF9333EA)],
+      ),
+    };
+
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
       decoration: BoxDecoration(
-        gradient: LinearGradient(
-          colors: isWeb
-              ? [const Color(0xFF0EA5E9), const Color(0xFF06B6D4)]
-              : [const Color(0xFFEC4899), const Color(0xFFF43F5E)],
-        ),
+        gradient: LinearGradient(colors: colors),
         borderRadius: BorderRadius.circular(16),
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(
-            isWeb ? Icons.travel_explore_rounded : Icons.auto_awesome_rounded,
-            size: 14,
-            color: Colors.white,
-          ),
+          Icon(icon, size: 14, color: Colors.white),
           const SizedBox(width: 4),
           Text(
-            isWeb ? 'Browse Web' : 'Create Image',
+            label,
             style: theme.textTheme.bodySmall?.copyWith(
               color: Colors.white,
               fontWeight: FontWeight.w600,

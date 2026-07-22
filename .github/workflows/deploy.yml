@@ -1,0 +1,144 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Deployment target
+        type: choice
+        required: true
+        default: staging
+        options:
+          - staging
+          - production
+
+env:
+  FLUTTER_VERSION_CHANNEL: stable
+
+jobs:
+  build:
+    name: Build deploy artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: npm ci
+
+      - name: Backend checks
+        working-directory: backend
+        run: |
+          npm run check
+          npm test
+          npm audit --omit=dev
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: ${{ env.FLUTTER_VERSION_CHANNEL }}
+          cache: true
+
+      - name: Install Flutter dependencies
+        run: flutter pub get
+
+      - name: Flutter checks
+        run: |
+          flutter analyze
+          flutter test
+          flutter build web --release
+
+      - name: Package web artifact
+        run: tar -czf deploy_web.tar.gz -C build/web .
+
+      - name: Package backend artifact
+        run: tar --exclude=node_modules --exclude=.env -czf deploy_backend.tar.gz -C backend .
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: askcore-${{ github.event.inputs.target }}-${{ github.sha }}
+          path: |
+            deploy_web.tar.gz
+            deploy_backend.tar.gz
+
+  deploy:
+    name: Deploy ${{ github.event.inputs.target }}
+    needs: build
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.target }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: askcore-${{ github.event.inputs.target }}-${{ github.sha }}
+
+      - name: Configure SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+        run: |
+          test -n "$SSH_PRIVATE_KEY"
+          test -n "$SSH_HOST"
+          test -n "$SSH_USER"
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
+
+      - name: Upload artifacts to server
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+        run: |
+          scp -i ~/.ssh/deploy_key deploy_web.tar.gz deploy_backend.tar.gz "$SSH_USER@$SSH_HOST:/tmp/"
+
+      - name: Activate release
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          WEB_ROOT: ${{ vars.WEB_ROOT || '/var/www/getai-web' }}
+          API_ROOT: ${{ vars.API_ROOT || '/var/www/getai-api' }}
+          PM2_APP: ${{ vars.PM2_APP || 'getai-api' }}
+        run: |
+          ssh -i ~/.ssh/deploy_key "$SSH_USER@$SSH_HOST" "set -e
+            mkdir -p '$WEB_ROOT' '$API_ROOT'
+            tar -xzf /tmp/deploy_web.tar.gz -C '$WEB_ROOT'/
+            chown -R www-data:www-data '$WEB_ROOT'
+            tar -xzf /tmp/deploy_backend.tar.gz -C '$API_ROOT'/
+            cd '$API_ROOT'
+            npm install --omit=dev
+            npm run check
+            npm run migrate
+            npm audit --omit=dev
+            pm2 restart '$PM2_APP' --update-env || pm2 start src/index.js --name '$PM2_APP'
+            pm2 save
+            rm -f /tmp/deploy_web.tar.gz /tmp/deploy_backend.tar.gz
+            systemctl reload nginx || systemctl restart nginx
+          "
+
+      - name: Smoke test deployment
+        env:
+          SMOKE_BASE_URL: ${{ vars.SMOKE_BASE_URL }}
+          SMOKE_USERNAME: ${{ secrets.SMOKE_USERNAME }}
+          SMOKE_PASSWORD: ${{ secrets.SMOKE_PASSWORD }}
+        run: |
+          npm --prefix backend run smoke -- --base-url "${SMOKE_BASE_URL:-https://askcore.dev}"

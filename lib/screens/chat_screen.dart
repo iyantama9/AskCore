@@ -1,5 +1,3 @@
-import 'dart:async';
-import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../helpers/clipboard_paste.dart';
@@ -15,6 +13,18 @@ import '../widgets/model_selector.dart';
 import '../widgets/welcome_view.dart';
 import 'playground_screen.dart';
 
+class _RetryPayload {
+  final String content;
+  final List<PendingFile> files;
+  final Set<ChatTool> tools;
+
+  const _RetryPayload({
+    required this.content,
+    required this.files,
+    required this.tools,
+  });
+}
+
 class ChatScreen extends StatefulWidget {
   final VoidCallback onLogout;
   const ChatScreen({super.key, required this.onLogout});
@@ -29,13 +39,13 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
 
   List<Map<String, dynamic>> _chats = [];
   List<ChatMessage> _messages = [];
-  final List<ModelInfo> _models = ChatService.allModels;
+  List<ModelInfo> _models = ChatService.allModels;
   int? _selectedChatId;
   String _currentModel = AppConstants.defaultModel;
   bool _isLoading = false;
   bool _sidebarOpen = true;
-  Timer? _typewriterTimer;
-
+  _RetryPayload? _lastRetryPayload;
+  String? _usageWarning;
   // Only animate the LATEST 2 messages (user + assistant)
   final Map<String, AnimationController> _animControllers = {};
 
@@ -43,17 +53,62 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
   List<PendingFile> _pendingFiles = [];
 
   // Active tools
-  Set<ChatTool> _activeTools = {};
+  final Set<ChatTool> _activeTools = {};
 
-  // Track the typing message index for scoped rebuilds
-  int? _typingIndex;
+  // Reasoning toggle for Claude Sonnet models
+  bool _reasoningEnabled = false;
 
   @override
   void initState() {
     super.initState();
+    _loadModelCatalog();
     _loadChats();
+    _loadUsage();
     // Setup web clipboard paste listener for images
     setupWebPasteListener(_onImagePasted);
+  }
+
+  Future<void> _loadModelCatalog() async {
+    final models = await ChatService().getModels();
+    if (!mounted) return;
+    setState(() {
+      _models = models.isEmpty ? ChatService.allModels : models;
+      if (!_models.any((m) => m.id == _currentModel)) {
+        _currentModel = _models.first.id;
+      }
+    });
+  }
+
+  Future<void> _loadUsage() async {
+    if (!_api.isLoggedIn) return;
+    try {
+      final data = await _api.getUsage();
+      final usage = List<Map<String, dynamic>>.from(data['usage'] as List);
+      final nearLimit = usage.where((item) {
+        final percent = (item['percent'] as num?)?.toDouble() ?? 0;
+        return percent >= 0.8;
+      }).toList();
+      if (!mounted) return;
+      setState(() {
+        _usageWarning = nearLimit.isEmpty
+            ? null
+            : 'Quota hampir habis: ${nearLimit.map((e) => e['kind']).join(', ')}';
+      });
+    } catch (_) {}
+  }
+
+  void _showErrorSnack(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message), duration: const Duration(seconds: 4)),
+    );
+  }
+
+  String _formatError(String message, {String? code, String? requestId}) {
+    final parts = <String>[message];
+    if (code != null && code.isNotEmpty) parts.add('Kode: $code');
+    if (requestId != null && requestId.isNotEmpty) parts.add('ID: $requestId');
+    return '⚠️ ${parts.join('\n')}';
   }
 
   Future<void> _onImagePasted(Uint8List bytes, String mimeType) async {
@@ -64,10 +119,12 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
       final result = await _api.uploadFile(bytes, fileName, mimeType);
       if (mounted) {
         setState(() {
-          _pendingFiles.add(PendingFile(
-            url: result['key'] ?? '',
-            name: result['file_name'] ?? fileName,
-          ));
+          _pendingFiles.add(
+            PendingFile(
+              url: result['key'] ?? '',
+              name: result['file_name'] ?? fileName,
+            ),
+          );
         });
       }
     } catch (_) {}
@@ -77,7 +134,6 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
   void dispose() {
     disposeWebPasteListener();
     _scrollController.dispose();
-    _typewriterTimer?.cancel();
     for (final c in _animControllers.values) {
       c.dispose();
     }
@@ -92,8 +148,6 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
   }
 
   Future<void> _loadMessages(int chatId) async {
-    _typewriterTimer?.cancel();
-    _typingIndex = null;
     _cleanupAnimControllers();
 
     try {
@@ -101,15 +155,18 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
       if (mounted) {
         setState(() {
           _messages = msgs
-              .map((m) => ChatMessage(
-                    id: m['id'].toString(),
-                    role: m['role'] == 'user'
-                        ? MessageRole.user
-                        : MessageRole.assistant,
-                    content: m['content'] ?? '',
-                    timestamp: DateTime.tryParse(m['created_at'] ?? '') ??
-                        DateTime.now(),
-                  ))
+              .map(
+                (m) => ChatMessage(
+                  id: m['id'].toString(),
+                  role: m['role'] == 'user'
+                      ? MessageRole.user
+                      : MessageRole.assistant,
+                  content: m['content'] ?? '',
+                  timestamp:
+                      DateTime.tryParse(m['created_at'] ?? '') ??
+                      DateTime.now(),
+                ),
+              )
               .toList();
         });
         _scrollToBottom();
@@ -145,54 +202,23 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
     });
   }
 
-  void _startTypewriter(int index, String fullContent) {
-    _typewriterTimer?.cancel();
-    int currentChar = 0;
-    final totalChars = fullContent.length;
-    int scrollCooldown = 0;
-
-    _typewriterTimer =
-        Timer.periodic(const Duration(milliseconds: 20), (timer) {
-      if (!mounted) {
-        timer.cancel();
-        return;
-      }
-
-      // Faster reveal: bigger chunks
-      final speed = (currentChar < 50) ? 3 : (currentChar < 200) ? 6 : 12;
-      currentChar = (currentChar + speed).clamp(0, totalChars);
-
-      setState(() {
-        _messages[index] = _messages[index].copyWith(
-          revealedChars: currentChar,
-        );
-      });
-
-      // Scroll every ~5 ticks instead of every tick
-      scrollCooldown++;
-      if (scrollCooldown >= 5) {
-        scrollCooldown = 0;
-        _scrollToBottom();
-      }
-
-      if (currentChar >= totalChars) {
-        timer.cancel();
-        setState(() {
-          _messages[index] = _messages[index].copyWith(
-            isTyping: false,
-            isLoading: false,
-            revealedChars: totalChars,
-          );
-          _typingIndex = null;
-        });
-        _scrollToBottom();
-      }
-    });
-  }
-
   Future<void> _selectChat(int chatId) async {
     setState(() => _selectedChatId = chatId);
     await _loadMessages(chatId);
+
+    // Sync reasoning toggle based on loaded model
+    final chat = _chats.firstWhere((c) => c['id'] == chatId);
+    final model = chat['model'] as String? ?? _currentModel;
+    setState(() {
+      _currentModel = model;
+      _reasoningEnabled = model == 'mk/sonnet-4.5-thinking';
+      if (_reasoningEnabled) {
+        _activeTools.add(ChatTool.reasoning);
+      } else {
+        _activeTools.remove(ChatTool.reasoning);
+      }
+    });
+
     if (mounted && Navigator.of(context).canPop()) {
       Navigator.of(context).pop();
     }
@@ -226,7 +252,48 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
     } catch (_) {}
   }
 
-  Future<void> _sendMessage(String content) async {
+  void _retryLastMessage() {
+    final payload = _lastRetryPayload;
+    if (payload == null || _isLoading) return;
+
+    setState(() {
+      if (_messages.isNotEmpty && _messages.last.isError) {
+        _messages.removeLast();
+      }
+      if (_messages.isNotEmpty && _messages.last.role == MessageRole.user) {
+        _messages.removeLast();
+      }
+    });
+
+    _sendMessage(payload.content, retryPayload: payload);
+  }
+
+  void _handleReasoningToggle(bool enabled) {
+    setState(() {
+      _reasoningEnabled = enabled;
+      if (enabled) {
+        _activeTools.add(ChatTool.reasoning);
+      } else {
+        _activeTools.remove(ChatTool.reasoning);
+      }
+
+      // Auto-switch between Sonnet base and thinking variants
+      if (_currentModel == 'mk/sonnet-4.5' ||
+          _currentModel == 'mk/sonnet-4.5-thinking') {
+        _currentModel = enabled ? 'mk/sonnet-4.5-thinking' : 'mk/sonnet-4.5';
+
+        // Persist to database
+        if (_selectedChatId != null) {
+          _api.updateChatModel(_selectedChatId!, _currentModel);
+        }
+      }
+    });
+  }
+
+  Future<void> _sendMessage(
+    String content, {
+    _RetryPayload? retryPayload,
+  }) async {
     if (_isLoading) return;
 
     if (_selectedChatId == null) {
@@ -239,9 +306,19 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
       }
     }
 
+    final filesForSend =
+        retryPayload?.files ?? List<PendingFile>.from(_pendingFiles);
+    final toolsForSend =
+        retryPayload?.tools ?? Set<ChatTool>.from(_activeTools);
+    _lastRetryPayload = _RetryPayload(
+      content: content,
+      files: filesForSend,
+      tools: toolsForSend,
+    );
+
     String userContent = content;
-    if (_pendingFiles.isNotEmpty) {
-      final names = _pendingFiles.map((f) => '📎 ${f.name}').join('\n');
+    if (filesForSend.isNotEmpty) {
+      final names = filesForSend.map((f) => '📎 ${f.name}').join('\n');
       userContent += '\n\n$names';
     }
 
@@ -263,15 +340,20 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
     });
     _scrollToBottom();
 
-    final toolsList = _activeTools
-        .map((t) => t == ChatTool.browseWeb ? 'browse_web' : 'create_image')
+    final toolsList = toolsForSend
+        .where((tool) => tool != ChatTool.reasoning)
+        .map(
+          (tool) => tool == ChatTool.browseWeb ? 'browse_web' : 'create_image',
+        )
         .toList();
-    final pendingFilesCopy = List<PendingFile>.from(_pendingFiles);
+    final pendingFilesCopy = List<PendingFile>.from(filesForSend);
 
     try {
       String accumulated = '';
       bool firstToken = true;
       final idx = _messages.indexWhere((m) => m.id == thinkingMsg.id);
+      int tokenCount = 0;
+      const updateInterval = 3; // Update UI every 3 tokens to reduce lag
 
       await for (final event in _api.sendMessageStream(
         _selectedChatId!,
@@ -284,6 +366,9 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
         switch (event.type) {
           case SseEventType.token:
             accumulated += event.token ?? '';
+            tokenCount++;
+
+            // Only update UI every N tokens or on first token
             if (firstToken && idx != -1) {
               firstToken = false;
               setState(() {
@@ -299,15 +384,17 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
                 );
                 _pendingFiles = [];
               });
-            } else if (idx != -1) {
+              _scrollToBottom();
+            } else if (idx != -1 && tokenCount >= updateInterval) {
+              tokenCount = 0; // Reset counter
               setState(() {
                 _messages[idx] = _messages[idx].copyWith(
                   content: accumulated,
                   revealedChars: accumulated.length,
                 );
               });
+              _scrollToBottom();
             }
-            _scrollToBottom();
             break;
 
           case SseEventType.done:
@@ -330,15 +417,21 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
           case SseEventType.error:
             if (idx != -1) {
               setState(() {
-                _messages[idx] = ChatMessage(
+                _messages[idx] = ChatMessage.error(
                   id: thinkingMsg.id,
-                  role: MessageRole.assistant,
-                  content: '⚠️ ${event.error}',
+                  content: _formatError(
+                    event.error ?? 'Request gagal. Coba lagi.',
+                    code: event.code,
+                    requestId: event.requestId,
+                  ),
                   timestamp: DateTime.now(),
+                  errorCode: event.code,
+                  requestId: event.requestId,
                 );
                 _isLoading = false;
               });
             }
+            _showErrorSnack(event.error ?? 'Request gagal. Coba lagi.');
             break;
         }
       }
@@ -348,17 +441,24 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
         setState(() => _isLoading = false);
       }
     } catch (e) {
-      final errMsg = ChatMessage(
+      final apiError = e is ApiException ? e : null;
+      final errMsg = ChatMessage.error(
         id: thinkingMsg.id,
-        role: MessageRole.assistant,
-        content: '⚠️ $e',
+        content: _formatError(
+          apiError?.message ?? e.toString(),
+          code: apiError?.code,
+          requestId: apiError?.requestId,
+        ),
         timestamp: DateTime.now(),
+        errorCode: apiError?.code,
+        requestId: apiError?.requestId,
       );
       setState(() {
         final idx = _messages.indexWhere((m) => m.id == thinkingMsg.id);
         if (idx != -1) _messages[idx] = errMsg;
         _isLoading = false;
       });
+      _showErrorSnack(apiError?.supportMessage ?? e.toString());
     }
     _scrollToBottom();
   }
@@ -376,6 +476,11 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
   }
 
   void _handleToolToggle(ChatTool tool) {
+    if (tool == ChatTool.reasoning) {
+      _handleReasoningToggle(!_reasoningEnabled);
+      return;
+    }
+
     setState(() {
       if (_activeTools.contains(tool)) {
         _activeTools.remove(tool);
@@ -384,7 +489,9 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
       }
       // Auto-switch model for create_image
       if (tool == ChatTool.createImage && _activeTools.contains(tool)) {
-        _currentModel = 'gemini-3-pro-image-preview';
+        _currentModel = 'qc/qwen-image-2.0';
+        _reasoningEnabled = false;
+        _activeTools.remove(ChatTool.reasoning);
         if (_selectedChatId != null) {
           _api.updateChatModel(_selectedChatId!, _currentModel);
         }
@@ -411,6 +518,40 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
 
     final chatBody = Column(
       children: [
+        if (_usageWarning != null)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 10, 16, 0),
+            child: Material(
+              color: theme.colorScheme.errorContainer.withValues(alpha: 0.45),
+              borderRadius: BorderRadius.circular(12),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 8,
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      Icons.warning_amber_rounded,
+                      size: 16,
+                      color: theme.colorScheme.onErrorContainer,
+                    ),
+                    const SizedBox(width: 8),
+                    Flexible(
+                      child: Text(
+                        _usageWarning!,
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: theme.colorScheme.onErrorContainer,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
         Expanded(
           child: _selectedChatId == null && _messages.isEmpty
               ? WelcomeView(onSuggestionTap: _sendMessage)
@@ -435,7 +576,11 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
                         final anim = _animControllers[msg.id];
                         // Wrap each message in RepaintBoundary to isolate repaints
                         return RepaintBoundary(
-                          child: MessageBubble(message: msg, animation: anim),
+                          child: MessageBubble(
+                            message: msg,
+                            animation: anim,
+                            onRetry: msg.isError ? _retryLastMessage : null,
+                          ),
                         );
                       },
                     ),
@@ -445,8 +590,9 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
         Center(
           child: ConstrainedBox(
             constraints: BoxConstraints(
-              maxWidth:
-                  isDesktop ? AppConstants.maxChatWidth + 48 : double.infinity,
+              maxWidth: isDesktop
+                  ? AppConstants.maxChatWidth + 48
+                  : double.infinity,
             ),
             child: RepaintBoundary(
               child: ChatInput(
@@ -458,6 +604,15 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
                 onClearAllAttachments: _clearAllAttachments,
                 activeTools: _activeTools,
                 onToolToggled: _handleToolToggle,
+                supportsReasoning:
+                    _currentModel == 'mk/sonnet-4.5' ||
+                    _currentModel == 'mk/sonnet-4.5-thinking',
+                currentModelSupportsVision: _models
+                    .firstWhere(
+                      (m) => m.id == _currentModel,
+                      orElse: () => _models.first,
+                    )
+                    .supportsVision,
               ),
             ),
           ),
@@ -471,9 +626,7 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
               icon: AnimatedSwitcher(
                 duration: const Duration(milliseconds: 200),
                 child: Icon(
-                  _sidebarOpen
-                      ? Icons.menu_open_rounded
-                      : Icons.menu_rounded,
+                  _sidebarOpen ? Icons.menu_open_rounded : Icons.menu_rounded,
                   key: ValueKey(_sidebarOpen),
                   size: 22,
                 ),
@@ -509,7 +662,16 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
             currentModel: _currentModel,
             models: _models,
             onModelChanged: (model) {
-              setState(() => _currentModel = model);
+              setState(() {
+                _currentModel = model;
+                // Sync reasoning tool when model changes
+                _reasoningEnabled = model == 'mk/sonnet-4.5-thinking';
+                if (_reasoningEnabled) {
+                  _activeTools.add(ChatTool.reasoning);
+                } else {
+                  _activeTools.remove(ChatTool.reasoning);
+                }
+              });
               // Persist model change to database for the active chat
               if (_selectedChatId != null) {
                 ApiService().updateChatModel(_selectedChatId!, model);
@@ -521,9 +683,9 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
         if (isDesktop) ...[
           const SizedBox(width: 4),
           IconButton(
-            onPressed: () => Navigator.of(context).push(
-              MaterialPageRoute(builder: (_) => const PlaygroundScreen()),
-            ),
+            onPressed: () => Navigator.of(
+              context,
+            ).push(MaterialPageRoute(builder: (_) => const PlaygroundScreen())),
             icon: const Icon(Icons.code_rounded, size: 20),
             tooltip: 'Playground',
           ),
@@ -546,8 +708,13 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
     if (isDesktop) {
       return CallbackShortcuts(
         bindings: {
-          const SingleActivator(LogicalKeyboardKey.keyN, control: true): _createNewChat,
-          const SingleActivator(LogicalKeyboardKey.keyS, control: true, shift: true): () {
+          const SingleActivator(LogicalKeyboardKey.keyN, control: true):
+              _createNewChat,
+          const SingleActivator(
+            LogicalKeyboardKey.keyS,
+            control: true,
+            shift: true,
+          ): () {
             setState(() => _sidebarOpen = !_sidebarOpen);
           },
         },

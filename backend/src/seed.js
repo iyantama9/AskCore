@@ -11,6 +11,13 @@ const users = [
 ];
 
 async function seed() {
+  if (process.env.ALLOW_INSECURE_SEED !== 'true') {
+    console.error(
+      'Refusing to seed default users. Set ALLOW_INSECURE_SEED=true only in local/dev environments.'
+    );
+    process.exit(1);
+  }
+
   await initDB();
 
   for (const user of users) {

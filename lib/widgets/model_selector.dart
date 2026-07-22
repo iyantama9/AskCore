@@ -49,7 +49,10 @@ class ModelSelector extends StatelessWidget {
             ConstrainedBox(
               constraints: BoxConstraints(maxWidth: isMobile ? 100 : 140),
               child: Text(
-                currentModel,
+                models
+                  .firstWhere((m) => m.id == currentModel,
+                              orElse: () => models.first)
+                  .displayName,
                 style: theme.textTheme.labelMedium?.copyWith(
                   fontWeight: FontWeight.w600,
                   fontSize: isMobile ? 11 : null,
@@ -68,7 +71,10 @@ class ModelSelector extends StatelessWidget {
       ),
       itemBuilder: (context) {
         final grouped = <String, List<ModelInfo>>{};
-        for (final model in models) {
+        // Filter out thinking models - they're only accessible via toggle
+        final visibleModels = models.where((m) => !m.id.contains('-thinking')).toList();
+
+        for (final model in visibleModels) {
           grouped.putIfAbsent(model.provider, () => []).add(model);
         }
 
@@ -101,7 +107,7 @@ class ModelSelector extends StatelessWidget {
                   const SizedBox(width: 8),
                   Expanded(
                     child: Text(
-                      model.id,
+                      model.displayName,
                       style: theme.textTheme.bodySmall?.copyWith(
                         fontWeight:
                             isSelected ? FontWeight.w600 : FontWeight.w400,

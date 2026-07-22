@@ -14,11 +14,18 @@ class FileUploadButton extends StatelessWidget {
   });
 
   Future<void> _pickAndUpload(BuildContext context) async {
-    final theme = Theme.of(context);
-
     final result = await FilePicker.platform.pickFiles(
       type: FileType.custom,
-      allowedExtensions: ['jpg', 'jpeg', 'png', 'gif', 'pdf', 'doc', 'docx', 'txt'],
+      allowedExtensions: [
+        'jpg',
+        'jpeg',
+        'png',
+        'gif',
+        'pdf',
+        'doc',
+        'docx',
+        'txt',
+      ],
       withData: true,
     );
 
@@ -28,9 +35,9 @@ class FileUploadButton extends StatelessWidget {
 
     if (file.bytes == null) {
       if (context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Could not read file')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('Could not read file')));
       }
       return;
     }
@@ -62,9 +69,9 @@ class FileUploadButton extends StatelessWidget {
       onFileUploaded(uploadResult);
     } catch (e) {
       if (context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Upload gagal: $e')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Upload gagal: $e')));
       }
     }
   }

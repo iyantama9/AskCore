@@ -6,9 +6,12 @@ class ChatMessage {
   final String content;
   final DateTime timestamp;
   final bool isLoading;
-  final bool isThinking;  // "Thinking..." phase
-  final bool isTyping;    // Typewriter reveal phase
+  final bool isThinking; // "Thinking..." phase
+  final bool isTyping; // Typewriter reveal phase
   final int revealedChars; // How many chars are revealed
+  final bool isError;
+  final String? errorCode;
+  final String? requestId;
 
   const ChatMessage({
     required this.id,
@@ -19,6 +22,9 @@ class ChatMessage {
     this.isThinking = false,
     this.isTyping = false,
     this.revealedChars = 0,
+    this.isError = false,
+    this.errorCode,
+    this.requestId,
   });
 
   factory ChatMessage.user(String content) {
@@ -41,6 +47,24 @@ class ChatMessage {
     );
   }
 
+  factory ChatMessage.error({
+    required String id,
+    required String content,
+    required DateTime timestamp,
+    String? errorCode,
+    String? requestId,
+  }) {
+    return ChatMessage(
+      id: id,
+      role: MessageRole.assistant,
+      content: content,
+      timestamp: timestamp,
+      isError: true,
+      errorCode: errorCode,
+      requestId: requestId,
+    );
+  }
+
   ChatMessage copyWith({
     String? id,
     String? content,
@@ -48,6 +72,9 @@ class ChatMessage {
     bool? isThinking,
     bool? isTyping,
     int? revealedChars,
+    bool? isError,
+    String? errorCode,
+    String? requestId,
   }) {
     return ChatMessage(
       id: id ?? this.id,
@@ -58,6 +85,9 @@ class ChatMessage {
       isThinking: isThinking ?? this.isThinking,
       isTyping: isTyping ?? this.isTyping,
       revealedChars: revealedChars ?? this.revealedChars,
+      isError: isError ?? this.isError,
+      errorCode: errorCode ?? this.errorCode,
+      requestId: requestId ?? this.requestId,
     );
   }
 

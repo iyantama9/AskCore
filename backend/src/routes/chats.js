@@ -1,6 +1,8 @@
 const express = require('express');
 const { pool } = require('../db');
 const authMiddleware = require('../middleware/auth');
+const { sendError } = require('../utils/errors');
+const { assertValidModel } = require('../utils/modelCatalog');
 
 const router = express.Router();
 router.use(authMiddleware);
@@ -16,24 +18,25 @@ router.get('/', async (req, res) => {
     );
     res.json(result.rows);
   } catch (err) {
-    console.error('List chats error:', err);
-    res.status(500).json({ error: 'Server error' });
+    return sendError(res, req, 500, 'Server error', err);
   }
 });
 
 // Create new chat
 router.post('/', async (req, res) => {
   const { title, model } = req.body;
+  const selectedModel = model || 'mk/sonnet-4.5';
+
   try {
+    assertValidModel(selectedModel);
     const result = await pool.query(
       `INSERT INTO chats (user_id, title, model)
        VALUES ($1, $2, $3) RETURNING *`,
-      [req.userId, title || 'New Chat', model || 'gemini-2.5-flash-lite']
+      [req.userId, title || 'New Chat', selectedModel]
     );
     res.status(201).json(result.rows[0]);
   } catch (err) {
-    console.error('Create chat error:', err);
-    res.status(500).json({ error: 'Server error' });
+    return sendError(res, req, err.statusCode || 500, err.publicMessage || err.message || 'Server error', err);
   }
 });
 
@@ -41,6 +44,7 @@ router.post('/', async (req, res) => {
 router.put('/:id', async (req, res) => {
   const { title, model } = req.body;
   try {
+    if (model) assertValidModel(model);
     const result = await pool.query(
       `UPDATE chats SET
         title = COALESCE($1, title),
@@ -50,12 +54,11 @@ router.put('/:id', async (req, res) => {
       [title, model, req.params.id, req.userId]
     );
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Chat not found' });
+      return sendError(res, req, 404, 'Chat not found');
     }
     res.json(result.rows[0]);
   } catch (err) {
-    console.error('Update chat error:', err);
-    res.status(500).json({ error: 'Server error' });
+    return sendError(res, req, err.statusCode || 500, err.publicMessage || err.message || 'Server error', err);
   }
 });
 
@@ -67,12 +70,11 @@ router.delete('/:id', async (req, res) => {
       [req.params.id, req.userId]
     );
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Chat not found' });
+      return sendError(res, req, 404, 'Chat not found');
     }
     res.json({ deleted: true });
   } catch (err) {
-    console.error('Delete chat error:', err);
-    res.status(500).json({ error: 'Server error' });
+    return sendError(res, req, 500, 'Server error', err);
   }
 });
 
@@ -80,7 +82,7 @@ router.delete('/:id', async (req, res) => {
 router.get('/search', async (req, res) => {
   const { q } = req.query;
   if (!q || q.trim().length < 2) {
-    return res.status(400).json({ error: 'Query too short' });
+    return sendError(res, req, 400, 'Query too short', null, 'QUERY_TOO_SHORT');
   }
   try {
     const result = await pool.query(
@@ -95,8 +97,7 @@ router.get('/search', async (req, res) => {
     );
     res.json(result.rows);
   } catch (err) {
-    console.error('Search error:', err);
-    res.status(500).json({ error: 'Server error' });
+    return sendError(res, req, 500, 'Search failed', err);
   }
 });
 

@@ -1,63 +1,113 @@
-import 'dart:convert';
-import 'package:http/http.dart' as http;
+import 'api_service.dart';
 
 class ChatService {
-  static const String _baseUrl = 'https://router.getcore.id/v1';
-  static const String _apiKey = 'intern1';
-
-  /// All available models from the router, hardcoded for instant loading.
+  /// Fallback model catalog used while the server catalog is loading/unavailable.
   static const List<ModelInfo> allModels = [
-    // Google Gemini
-    ModelInfo(id: 'gemini-2.5-flash', ownedBy: 'Google'),
-    ModelInfo(id: 'gemini-2.5-flash-lite', ownedBy: 'Google'),
-    ModelInfo(id: 'gemini-2.5-pro', ownedBy: 'Google'),
-    ModelInfo(id: 'gemini-3-flash-preview', ownedBy: 'Google'),
-    ModelInfo(id: 'gemini-3-pro-preview', ownedBy: 'Google'),
-    ModelInfo(id: 'gemini-3-pro-image-preview', ownedBy: 'Google'),
-    // OpenAI GPT
-    ModelInfo(id: 'gpt-5', ownedBy: 'OpenAI'),
-    ModelInfo(id: 'gpt-5.1', ownedBy: 'OpenAI'),
-    ModelInfo(id: 'gpt-5.1-codex', ownedBy: 'OpenAI'),
-    ModelInfo(id: 'gpt-5.1-codex-max', ownedBy: 'OpenAI'),
-    ModelInfo(id: 'gpt-5.1-codex-mini', ownedBy: 'OpenAI'),
-    ModelInfo(id: 'gpt-5.2', ownedBy: 'OpenAI'),
-    ModelInfo(id: 'gpt-5.2-codex', ownedBy: 'OpenAI'),
-    ModelInfo(id: 'gpt-5-codex', ownedBy: 'OpenAI'),
-    ModelInfo(id: 'gpt-5-codex-mini', ownedBy: 'OpenAI'),
-    // Anthropic Claude
-    ModelInfo(id: 'claude-opus-4-5-20251101', ownedBy: 'Anthropic'),
-    ModelInfo(id: 'claude-opus-4-1-20250805', ownedBy: 'Anthropic'),
-    ModelInfo(id: 'claude-opus-4-20250514', ownedBy: 'Anthropic'),
-    ModelInfo(id: 'claude-sonnet-4-5-20250929', ownedBy: 'Anthropic'),
-    ModelInfo(id: 'claude-sonnet-4-20250514', ownedBy: 'Anthropic'),
-    ModelInfo(id: 'claude-3-7-sonnet-20250219', ownedBy: 'Anthropic'),
-    ModelInfo(id: 'claude-haiku-4-5-20251001', ownedBy: 'Anthropic'),
-    ModelInfo(id: 'claude-3-5-haiku-20241022', ownedBy: 'Anthropic'),
+    ModelInfo(
+      id: 'mk/sonnet-4.5',
+      ownedBy: 'Anthropic',
+      displayNameOverride: 'Sonnet 4.5',
+      supportsReasoning: true,
+      supportsVision: true,
+      supportsBrowse: true,
+      costTier: 'premium',
+    ),
+    ModelInfo(
+      id: 'mk/sonnet-4.5-thinking',
+      ownedBy: 'Anthropic',
+      displayNameOverride: 'Sonnet 4.5',
+      supportsReasoning: true,
+      supportsVision: true,
+      supportsBrowse: true,
+      costTier: 'premium',
+    ),
+    ModelInfo(
+      id: 'dh/moonshotai/Kimi-K2.6',
+      ownedBy: 'Moonshot',
+      displayNameOverride: 'Kimi K2.6',
+      supportsVision: true,
+      supportsBrowse: true,
+      costTier: 'standard',
+    ),
+    ModelInfo(
+      id: 'qc/glm-5.2',
+      ownedBy: 'Zhipu',
+      displayNameOverride: 'GLM 5.2',
+      supportsVision: true,
+      supportsBrowse: true,
+      costTier: 'standard',
+    ),
+    ModelInfo(
+      id: 'kc/minimax-m3',
+      ownedBy: 'MiniMax',
+      displayNameOverride: 'MiniMax M3',
+      supportsBrowse: true,
+      costTier: 'standard',
+    ),
+    ModelInfo(
+      id: 'qc/qwen-image-2.0',
+      ownedBy: 'Alibaba',
+      displayNameOverride: 'Qwen Image 2.0',
+      supportsImageGen: true,
+      costTier: 'image',
+    ),
+    ModelInfo(
+      id: 'qc/qwen-image-2.0-pro',
+      ownedBy: 'Alibaba',
+      displayNameOverride: 'Qwen Image Pro',
+      supportsImageGen: true,
+      costTier: 'image',
+    ),
   ];
 
   Future<List<ModelInfo>> getModels() async {
-    // Return hardcoded models instantly — no network request needed
-    return allModels;
+    try {
+      final models = await ApiService().getModels();
+      return models.map(ModelInfo.fromJson).toList();
+    } catch (_) {
+      return allModels;
+    }
   }
 }
 
 class ModelInfo {
   final String id;
   final String ownedBy;
+  final String? displayNameOverride;
+  final bool supportsReasoning;
+  final bool supportsVision;
+  final bool supportsImageGen;
+  final bool supportsBrowse;
+  final String costTier;
 
-  const ModelInfo({required this.id, required this.ownedBy});
+  const ModelInfo({
+    required this.id,
+    required this.ownedBy,
+    this.displayNameOverride,
+    this.supportsReasoning = false,
+    this.supportsVision = false,
+    this.supportsImageGen = false,
+    this.supportsBrowse = false,
+    this.costTier = 'standard',
+  });
 
-  String get displayName {
-    return id
-        .replaceAll('-', ' ')
-        .split(' ')
-        .map((w) => w.isNotEmpty ? '${w[0].toUpperCase()}${w.substring(1)}' : w)
-        .join(' ');
+  factory ModelInfo.fromJson(Map<String, dynamic> json) {
+    return ModelInfo(
+      id: json['id']?.toString() ?? '',
+      ownedBy: json['owned_by']?.toString() ?? json['ownedBy']?.toString() ?? 'Unknown',
+      displayNameOverride:
+          json['display_name']?.toString() ?? json['displayName']?.toString(),
+      supportsReasoning: json['supports_reasoning'] == true,
+      supportsVision: json['supports_vision'] == true,
+      supportsImageGen: json['supports_image_generation'] == true,
+      supportsBrowse: json['supports_browse'] == true,
+      costTier: json['cost_tier']?.toString() ?? 'standard',
+    );
   }
 
-  String get provider => ownedBy;
+  String get displayName => displayNameOverride ?? id;
 
-  bool get supportsImageGen => id.contains('image');
+  String get provider => ownedBy;
 }
 
 class ChatException implements Exception {

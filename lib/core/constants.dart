@@ -1,14 +1,13 @@
-
 class AppConstants {
   AppConstants._();
 
   static const String appName = 'AskCore';
 
-  /// Production backend via Nginx + Let's Encrypt SSL
-  /// For local dev, change to: 'http://localhost:4000'
-  static const String backendUrl = 'https://askcore.duckdns.org';
+  /// Production backend served from the same origin via Nginx.
+  /// For local dev, change to: 'http://localhost:4001'
+  static const String backendUrl = 'https://askcore.dev';
 
-  static const String defaultModel = 'gemini-2.5-flash-lite';
+  static const String defaultModel = 'mk/sonnet-4.5';
 
   static const double maxChatWidth = 800.0;
   static const double mobileBreakpoint = 600.0;

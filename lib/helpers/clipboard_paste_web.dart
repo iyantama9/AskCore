@@ -1,3 +1,5 @@
+// ignore_for_file: avoid_web_libraries_in_flutter, deprecated_member_use
+
 // Web-specific clipboard image paste support
 // This file uses dart:html which is only available on web
 import 'dart:async';

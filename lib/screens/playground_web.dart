@@ -1,3 +1,5 @@
+// ignore_for_file: avoid_web_libraries_in_flutter, deprecated_member_use
+
 import 'dart:html' as html;
 import 'dart:ui_web' as ui_web;
 import 'package:flutter/material.dart';
@@ -40,7 +42,8 @@ class _PlaygroundScreenState extends State<PlaygroundScreen>
   <div id="output"></div>
 </div>''';
 
-  static const _defaultCss = '''* { margin: 0; padding: 0; box-sizing: border-box; }
+  static const _defaultCss =
+      '''* { margin: 0; padding: 0; box-sizing: border-box; }
 
 body {
   font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
@@ -142,13 +145,13 @@ btn.addEventListener('click', () => {
 
 ## Features
 - **Bold text** and *italic text*
-- Inline code: \`console.log("hello")\`
+- Inline code: `console.log("hello")`
 
-\`\`\`javascript
+```javascript
 function greet(name) {
-  return \`Hello, \${name}!\`;
+  return `Hello, \${name}!`;
 }
-\`\`\`
+```
 
 | Feature | Status |
 |---------|--------|
@@ -182,8 +185,10 @@ function greet(name) {
       ..setAttribute('sandbox', 'allow-scripts allow-same-origin');
 
     // ignore: undefined_prefixed_name
-    ui_web.platformViewRegistry
-        .registerViewFactory(_viewType, (int id) => _iframe);
+    ui_web.platformViewRegistry.registerViewFactory(
+      _viewType,
+      (int id) => _iframe,
+    );
 
     setState(() => _ready = true);
     Future.delayed(const Duration(milliseconds: 300), () {
@@ -206,32 +211,55 @@ function greet(name) {
   }
 
   void _runWeb() {
-    _iframe.srcdoc = '''<!DOCTYPE html>
+    _iframe.srcdoc =
+        '''<!DOCTYPE html>
 <html><head><meta charset="UTF-8">
 <style>${_cssCtrl.text}</style></head>
 <body>${_htmlCtrl.text}
-<script>${_jsCtrl.text}<\/script></body></html>''';
+<script>${_jsCtrl.text}</script></body></html>''';
   }
 
   void _runMd() {
     String h = _mdCtrl.text;
-    h = h.replaceAllMapped(RegExp(r'```\w*\n([\s\S]*?)```'), (m) =>
-        '<pre><code>${_esc(m[1]!)}</code></pre>');
-    h = h.replaceAllMapped(RegExp(r'`([^`]+)`'), (m) =>
-        '<code>${m[1]}</code>');
-    h = h.replaceAllMapped(RegExp(r'^### (.+)$', multiLine: true), (m) => '<h3>${m[1]}</h3>');
-    h = h.replaceAllMapped(RegExp(r'^## (.+)$', multiLine: true), (m) => '<h2>${m[1]}</h2>');
-    h = h.replaceAllMapped(RegExp(r'^# (.+)$', multiLine: true), (m) => '<h1>${m[1]}</h1>');
-    h = h.replaceAllMapped(RegExp(r'\*\*(.+?)\*\*'), (m) => '<strong>${m[1]}</strong>');
+    h = h.replaceAllMapped(
+      RegExp(r'```\w*\n([\s\S]*?)```'),
+      (m) => '<pre><code>${_esc(m[1]!)}</code></pre>',
+    );
+    h = h.replaceAllMapped(RegExp(r'`([^`]+)`'), (m) => '<code>${m[1]}</code>');
+    h = h.replaceAllMapped(
+      RegExp(r'^### (.+)$', multiLine: true),
+      (m) => '<h3>${m[1]}</h3>',
+    );
+    h = h.replaceAllMapped(
+      RegExp(r'^## (.+)$', multiLine: true),
+      (m) => '<h2>${m[1]}</h2>',
+    );
+    h = h.replaceAllMapped(
+      RegExp(r'^# (.+)$', multiLine: true),
+      (m) => '<h1>${m[1]}</h1>',
+    );
+    h = h.replaceAllMapped(
+      RegExp(r'\*\*(.+?)\*\*'),
+      (m) => '<strong>${m[1]}</strong>',
+    );
     h = h.replaceAllMapped(RegExp(r'\*(.+?)\*'), (m) => '<em>${m[1]}</em>');
-    h = h.replaceAllMapped(RegExp(r'\[([^\]]+)\]\(([^)]+)\)'), (m) =>
-        '<a href="${m[2]}">${m[1]}</a>');
-    h = h.replaceAllMapped(RegExp(r'^- (.+)$', multiLine: true), (m) => '<li>${m[1]}</li>');
-    h = h.replaceAllMapped(RegExp(r'^> (.+)$', multiLine: true), (m) =>
-        '<blockquote>${m[1]}</blockquote>');
+    h = h.replaceAllMapped(
+      RegExp(r'\[([^\]]+)\]\(([^)]+)\)'),
+      (m) => '<a href="${m[2]}">${m[1]}</a>',
+    );
+    h = h.replaceAllMapped(
+      RegExp(r'^- (.+)$', multiLine: true),
+      (m) => '<li>${m[1]}</li>',
+    );
+    h = h.replaceAllMapped(
+      RegExp(r'^> (.+)$', multiLine: true),
+      (m) => '<blockquote>${m[1]}</blockquote>',
+    );
     h = h.replaceAll(RegExp(r'^---$', multiLine: true), '<hr>');
     h = h.replaceAllMapped(RegExp(r'^\|(.+)\|$', multiLine: true), (m) {
-      final cells = m[1]!.split('|').map((c) => c.trim())
+      final cells = m[1]!
+          .split('|')
+          .map((c) => c.trim())
           .where((c) => c.isNotEmpty && !RegExp(r'^[-]+$').hasMatch(c));
       if (cells.isEmpty) return '';
       return '<tr>${cells.map((c) => '<td>$c</td>').join()}</tr>';
@@ -258,7 +286,10 @@ strong{color:#fff}em{color:#a78bfa}
 </style></head><body>$h</body></html>''';
   }
 
-  String _esc(String s) => s.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+  String _esc(String s) => s
+      .replaceAll('&', '&amp;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;');
 
   @override
   Widget build(BuildContext context) {
@@ -320,7 +351,10 @@ strong{color:#fff}em{color:#a78bfa}
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
             decoration: BoxDecoration(
               gradient: LinearGradient(
-                colors: [_accent.withValues(alpha: 0.15), _accent.withValues(alpha: 0.05)],
+                colors: [
+                  _accent.withValues(alpha: 0.15),
+                  _accent.withValues(alpha: 0.05),
+                ],
               ),
               borderRadius: BorderRadius.circular(8),
               border: Border.all(color: _accent.withValues(alpha: 0.2)),
@@ -330,8 +364,14 @@ strong{color:#fff}em{color:#a78bfa}
               children: [
                 Icon(Icons.terminal_rounded, color: _accent, size: 14),
                 const SizedBox(width: 6),
-                const Text('Playground',
-                  style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600, letterSpacing: 0.3),
+                const Text(
+                  'Playground',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                    letterSpacing: 0.3,
+                  ),
                 ),
               ],
             ),
@@ -405,7 +445,8 @@ strong{color:#fff}em{color:#a78bfa}
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
                   Container(
-                    width: 7, height: 7,
+                    width: 7,
+                    height: 7,
                     decoration: BoxDecoration(
                       color: tabs[i].$2,
                       shape: BoxShape.circle,
@@ -521,13 +562,20 @@ strong{color:#fff}em{color:#a78bfa}
       child: Row(
         children: [
           Container(
-            width: 8, height: 8,
-            decoration: const BoxDecoration(color: _green, shape: BoxShape.circle),
+            width: 8,
+            height: 8,
+            decoration: const BoxDecoration(
+              color: _green,
+              shape: BoxShape.circle,
+            ),
           ),
           const SizedBox(width: 6),
           Text('Ready', style: TextStyle(fontSize: 11, color: _textMuted)),
           const Spacer(),
-          Text(langs[_activeTab], style: TextStyle(fontSize: 11, color: _textMuted)),
+          Text(
+            langs[_activeTab],
+            style: TextStyle(fontSize: 11, color: _textMuted),
+          ),
           const SizedBox(width: 12),
           Text('UTF-8', style: TextStyle(fontSize: 11, color: _textDim)),
         ],
@@ -543,7 +591,10 @@ strong{color:#fff}em{color:#a78bfa}
         gradient: LinearGradient(
           begin: Alignment.topCenter,
           end: Alignment.bottomCenter,
-          colors: [_accent.withValues(alpha: 0.3), _accent.withValues(alpha: 0.05)],
+          colors: [
+            _accent.withValues(alpha: 0.3),
+            _accent.withValues(alpha: 0.05),
+          ],
         ),
       ),
     );
@@ -561,14 +612,20 @@ strong{color:#fff}em{color:#a78bfa}
       child: Row(
         children: [
           // Traffic lights
-          ...[const Color(0xFFFF5F57), const Color(0xFFFFBD2E), const Color(0xFF28C840)]
-              .map((c) => Padding(
-                    padding: const EdgeInsets.only(right: 6),
-                    child: Container(
-                      width: 10, height: 10,
-                      decoration: BoxDecoration(color: c, shape: BoxShape.circle),
-                    ),
-                  )),
+          ...[
+            const Color(0xFFFF5F57),
+            const Color(0xFFFFBD2E),
+            const Color(0xFF28C840),
+          ].map(
+            (c) => Padding(
+              padding: const EdgeInsets.only(right: 6),
+              child: Container(
+                width: 10,
+                height: 10,
+                decoration: BoxDecoration(color: c, shape: BoxShape.circle),
+              ),
+            ),
+          ),
           const SizedBox(width: 10),
           // URL bar
           Expanded(
@@ -586,7 +643,11 @@ strong{color:#fff}em{color:#a78bfa}
                   const SizedBox(width: 6),
                   Text(
                     'localhost:preview',
-                    style: TextStyle(fontSize: 11, color: _textMuted, fontFamily: 'monospace'),
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: _textMuted,
+                      fontFamily: 'monospace',
+                    ),
                   ),
                 ],
               ),
@@ -639,7 +700,13 @@ class _RunButtonState extends State<_RunButton> {
             ),
             borderRadius: BorderRadius.circular(8),
             boxShadow: _hover
-                ? [BoxShadow(color: const Color(0xFF22C55E).withValues(alpha: 0.35), blurRadius: 12, offset: const Offset(0, 2))]
+                ? [
+                    BoxShadow(
+                      color: const Color(0xFF22C55E).withValues(alpha: 0.35),
+                      blurRadius: 12,
+                      offset: const Offset(0, 2),
+                    ),
+                  ]
                 : [],
           ),
           child: Row(
@@ -647,8 +714,14 @@ class _RunButtonState extends State<_RunButton> {
             children: [
               Icon(Icons.play_arrow_rounded, color: Colors.white, size: 15),
               const SizedBox(width: 4),
-              const Text('Run',
-                style: TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.w700, letterSpacing: 0.3),
+              const Text(
+                'Run',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 0.3,
+                ),
               ),
             ],
           ),

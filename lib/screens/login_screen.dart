@@ -18,6 +18,7 @@ class _LoginScreenState extends State<LoginScreen>
   final _api = ApiService();
   bool _isLoading = false;
   bool _obscurePassword = true;
+  bool _isRegisterMode = false;
   String? _error;
   late AnimationController _animController;
 
@@ -38,12 +39,17 @@ class _LoginScreenState extends State<LoginScreen>
     super.dispose();
   }
 
-  Future<void> _handleLogin() async {
+  Future<void> _handleSubmit() async {
     final username = _usernameController.text.trim();
     final password = _passwordController.text;
 
     if (username.isEmpty || password.isEmpty) {
       setState(() => _error = 'Username dan password harus diisi');
+      return;
+    }
+
+    if (_isRegisterMode && password.length < 8) {
+      setState(() => _error = 'Password minimal 8 karakter');
       return;
     }
 
@@ -53,7 +59,11 @@ class _LoginScreenState extends State<LoginScreen>
     });
 
     try {
-      await _api.login(username, password);
+      if (_isRegisterMode) {
+        await _api.register(username, password);
+      } else {
+        await _api.login(username, password);
+      }
       widget.onLoginSuccess();
     } on ApiException catch (e) {
       setState(() => _error = e.message);
@@ -62,6 +72,13 @@ class _LoginScreenState extends State<LoginScreen>
     } finally {
       if (mounted) setState(() => _isLoading = false);
     }
+  }
+
+  void _toggleMode() {
+    setState(() {
+      _isRegisterMode = !_isRegisterMode;
+      _error = null;
+    });
   }
 
   @override
@@ -94,7 +111,6 @@ class _LoginScreenState extends State<LoginScreen>
                 child: Column(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
-                    // Real Logo
                     ClipRRect(
                       borderRadius: BorderRadius.circular(24),
                       child: Image.asset(
@@ -114,7 +130,9 @@ class _LoginScreenState extends State<LoginScreen>
                     ),
                     const SizedBox(height: 8),
                     Text(
-                      'Sign in to continue',
+                      _isRegisterMode
+                          ? 'Create an account to continue'
+                          : 'Sign in to continue',
                       style: theme.textTheme.bodyLarge?.copyWith(
                         color: theme.colorScheme.onSurfaceVariant,
                       ),
@@ -123,6 +141,8 @@ class _LoginScreenState extends State<LoginScreen>
                     TextField(
                       controller: _usernameController,
                       textInputAction: TextInputAction.next,
+                      autocorrect: false,
+                      enableSuggestions: false,
                       style: theme.textTheme.bodyMedium,
                       decoration: const InputDecoration(
                         hintText: 'Username',
@@ -134,10 +154,12 @@ class _LoginScreenState extends State<LoginScreen>
                       controller: _passwordController,
                       obscureText: _obscurePassword,
                       textInputAction: TextInputAction.done,
-                      onSubmitted: (_) => _handleLogin(),
+                      onSubmitted: (_) => _handleSubmit(),
                       style: theme.textTheme.bodyMedium,
                       decoration: InputDecoration(
-                        hintText: 'Password',
+                        hintText: _isRegisterMode
+                            ? 'Password (min 8 karakter)'
+                            : 'Password',
                         prefixIcon: const Icon(Icons.lock_outline_rounded),
                         suffixIcon: IconButton(
                           icon: Icon(
@@ -147,12 +169,22 @@ class _LoginScreenState extends State<LoginScreen>
                             size: 20,
                           ),
                           onPressed: () => setState(
-                              () => _obscurePassword = !_obscurePassword),
+                            () => _obscurePassword = !_obscurePassword,
+                          ),
                         ),
                       ),
                     ),
                     const SizedBox(height: 12),
-                    if (_error != null)
+                    if (_isRegisterMode)
+                      Text(
+                        'Maksimal 3 akun per IP per hari untuk mencegah abuse.',
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                        textAlign: TextAlign.center,
+                      ),
+                    if (_error != null) ...[
+                      const SizedBox(height: 12),
                       Container(
                         width: double.infinity,
                         padding: const EdgeInsets.all(12),
@@ -170,12 +202,13 @@ class _LoginScreenState extends State<LoginScreen>
                           textAlign: TextAlign.center,
                         ),
                       ),
+                    ],
                     const SizedBox(height: 24),
                     SizedBox(
                       width: double.infinity,
                       height: 52,
                       child: ElevatedButton(
-                        onPressed: _isLoading ? null : _handleLogin,
+                        onPressed: _isLoading ? null : _handleSubmit,
                         child: _isLoading
                             ? const SizedBox(
                                 width: 22,
@@ -185,13 +218,22 @@ class _LoginScreenState extends State<LoginScreen>
                                   color: Colors.white,
                                 ),
                               )
-                            : const Text(
-                                'Sign In',
-                                style: TextStyle(
+                            : Text(
+                                _isRegisterMode ? 'Create Account' : 'Sign In',
+                                style: const TextStyle(
                                   fontSize: 16,
                                   fontWeight: FontWeight.w600,
                                 ),
                               ),
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    TextButton(
+                      onPressed: _isLoading ? null : _toggleMode,
+                      child: Text(
+                        _isRegisterMode
+                            ? 'Sudah punya akun? Sign in'
+                            : 'Belum punya akun? Register',
                       ),
                     ),
                   ],

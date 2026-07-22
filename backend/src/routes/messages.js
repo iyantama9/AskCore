@@ -2,9 +2,131 @@ const express = require('express');
 const { pool } = require('../db');
 const authMiddleware = require('../middleware/auth');
 const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { validatePublicHttpUrl } = require('../utils/urlSafety');
+const { assertCanReadR2Key, recordFile } = require('../utils/files');
+const { sendError } = require('../utils/errors');
+const { assertQuota, recordUsage } = require('../utils/usage');
+const { assertValidModel } = require('../utils/modelCatalog');
+const logger = require('../utils/logger');
+const metrics = require('../utils/metrics');
 
 const router = express.Router();
 router.use(authMiddleware);
+
+const TITLE_MODEL = 'qc/qwen-flash';
+
+function toAnthropicContent(content) {
+  if (!Array.isArray(content)) return content;
+
+  return content.map((part) => {
+    if (part.type === 'image_url') {
+      const dataUrl = part.image_url?.url || '';
+      const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/s);
+      if (match) {
+        return {
+          type: 'image',
+          source: { type: 'base64', media_type: match[1], data: match[2] },
+        };
+      }
+    }
+    return part;
+  });
+}
+
+async function fetchAI({ model, messages, stream = false, max_tokens = 4096 }) {
+  const started = process.hrtime.bigint();
+  const streamLabel = stream ? 'true' : 'false';
+  const system = messages
+    .filter((message) => message.role === 'system')
+    .map((message) => message.content)
+    .filter(Boolean)
+    .join('\n\n');
+
+  const anthropicMessages = messages
+    .filter((message) => message.role !== 'system')
+    .map((message) => ({
+      role: message.role,
+      content: toAnthropicContent(message.content),
+    }));
+
+  const response = await fetch(`${process.env.AI_BASE_URL}/messages`, {
+    method: 'POST',
+    headers: {
+      'x-api-key': process.env.AI_API_KEY,
+      'anthropic-version': '2023-06-01',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model,
+      messages: anthropicMessages,
+      ...(system ? { system } : {}),
+      max_tokens,
+      stream,
+    }),
+  });
+
+  const durationMs = Number(process.hrtime.bigint() - started) / 1_000_000;
+  metrics.observe('ai_latency_ms', durationMs, {
+    model,
+    stream: streamLabel,
+    status: String(response.status),
+  });
+  if (!response.ok) {
+    metrics.inc('ai_failures_total', {
+      model,
+      stream: streamLabel,
+      status: String(response.status),
+    });
+  }
+
+  if (stream) return response;
+
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const message = data.error?.message || data.error || data.detail || 'AI API error';
+    return new Response(JSON.stringify({ error: { message } }), {
+      status: response.status,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  const content = Array.isArray(data.content)
+    ? data.content.filter((block) => block.type === 'text').map((block) => block.text).join('')
+    : '';
+  const images = Array.isArray(data.content)
+    ? data.content
+        .filter((block) => block.type === 'image')
+        .map((block) => {
+          if (block.source?.type === 'url') {
+            return { image_url: { url: block.source.url } };
+          }
+          if (block.source?.type === 'base64') {
+            return {
+              image_url: {
+                url: `data:${block.source.media_type};base64,${block.source.data}`,
+              },
+            };
+          }
+          return null;
+        })
+        .filter(Boolean)
+    : [];
+
+  return new Response(JSON.stringify({
+    choices: [{
+      message: {
+        role: 'assistant',
+        content,
+        ...(images.length > 0 ? { images } : {}),
+      },
+      finish_reason: data.stop_reason || 'stop',
+    }],
+    usage: data.usage || {},
+  }), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
 
 // S3/R2 singleton client
 const s3Client = new S3Client({
@@ -89,10 +211,11 @@ async function executeSearch(query) {
       text += '(Tidak ada hasil ditemukan)\n';
     }
 
-    console.log(`[SEARCH] Found ${top.length} results for: ${query}`);
+    logger.info('browse_search_complete', { result_count: top.length });
     return { type: 'search', query, results: top, text, resultCount: top.length };
   } catch (err) {
-    console.error('[SEARCH ERROR]', err.message);
+    metrics.inc('browse_failures_total', { action: 'search' });
+    logger.warn('browse_search_failed', { error: err.message });
     return { type: 'search', query, results: [], text: `Pencarian gagal: ${err.message}`, resultCount: 0 };
   }
 }
@@ -166,7 +289,7 @@ async function getSharedBrowser() {
     executablePath: process.env.CHROME_PATH || undefined,
   });
 
-  console.log('[BROWSE] Stealth browser launched');
+  logger.info('browse_browser_launched', { mode: 'stealth' });
   sharedIdleTimer = setTimeout(async () => {
     try { await sharedBrowser.close(); } catch(_) {}
     sharedBrowser = null;
@@ -175,83 +298,104 @@ async function getSharedBrowser() {
   return sharedBrowser;
 }
 
-async function executeBrowseCommand(cmd, req) {
-  const browser = await getSharedBrowser();
-  const pages = await browser.pages();
-  let page = pages.length > 0 ? pages[pages.length - 1] : await browser.newPage();
-  // Set realistic user agent to bypass bot detection
-  await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36');
-  await page.setViewport({ width: 1280, height: 800 });
-
-  switch (cmd.action) {
-    case 'navigate': {
-      const url = cmd.url.startsWith('http') ? cmd.url : `https://${cmd.url}`;
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
-      await new Promise(r => setTimeout(r, 1500));
-      break;
-    }
-    case 'click':
-      if (cmd.selector) {
-        await page.click(cmd.selector).catch(() => {});
-        await new Promise(r => setTimeout(r, 1000));
-      }
-      break;
-    case 'type':
-      if (cmd.selector && cmd.text) {
-        await page.type(cmd.selector, cmd.text, { delay: 50 }).catch(() => {});
-        await new Promise(r => setTimeout(r, 500));
-      }
-      break;
-    case 'scroll':
-      await page.evaluate((d) => window.scrollBy(0, d), cmd.scroll_direction === 'up' ? -500 : 500);
-      await new Promise(r => setTimeout(r, 500));
-      break;
-    case 'press_enter':
-      await page.keyboard.press('Enter');
-      await new Promise(r => setTimeout(r, 2000));
-      break;
+async function createIsolatedContext(browser) {
+  if (typeof browser.createBrowserContext === 'function') {
+    return browser.createBrowserContext();
   }
+  if (typeof browser.createIncognitoBrowserContext === 'function') {
+    return browser.createIncognitoBrowserContext();
+  }
+  return browser;
+}
 
-  // Screenshot
-  const screenshotBuffer = await page.screenshot({ type: 'jpeg', quality: 60 });
-  const key = `browse/${req.userId}/${Date.now()}.jpg`;
-  await s3Client.send(new PutObjectCommand({
-    Bucket: process.env.R2_BUCKET_NAME, Key: key, Body: screenshotBuffer, ContentType: 'image/jpeg',
-  }));
-  const proto = req.get('x-forwarded-proto') || req.protocol;
-  const host = req.get('x-forwarded-host') || req.get('host');
+async function executeBrowseCommand(cmd, req) {
+  const safeNavigateUrl = cmd.action === 'navigate' ? await validatePublicHttpUrl(cmd.url) : null;
+  const browser = await getSharedBrowser();
+  const context = await createIsolatedContext(browser);
+  try {
+    const page = await context.newPage();
+    // Set realistic user agent to bypass bot detection
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36');
+    await page.setViewport({ width: 1280, height: 800 });
 
-  // Extract text
-  const pageText = await page.evaluate(() => {
-    const clone = document.body.cloneNode(true);
-    clone.querySelectorAll('script, style, noscript, svg').forEach(el => el.remove());
-    return (clone.innerText || '').substring(0, 3000);
-  }).catch(() => '');
+    switch (cmd.action) {
+      case 'navigate': {
+        await page.goto(safeNavigateUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+        await new Promise(r => setTimeout(r, 1500));
+        break;
+      }
+      case 'click':
+        if (cmd.selector) {
+          await page.click(cmd.selector).catch(() => {});
+          await new Promise(r => setTimeout(r, 1000));
+        }
+        break;
+      case 'type':
+        if (cmd.selector && cmd.text) {
+          await page.type(cmd.selector, cmd.text, { delay: 50 }).catch(() => {});
+          await new Promise(r => setTimeout(r, 500));
+        }
+        break;
+      case 'scroll':
+        await page.evaluate((d) => window.scrollBy(0, d), cmd.scroll_direction === 'up' ? -500 : 500);
+        await new Promise(r => setTimeout(r, 500));
+        break;
+      case 'press_enter':
+        await page.keyboard.press('Enter');
+        await new Promise(r => setTimeout(r, 2000));
+        break;
+    }
 
-  // Extract elements
-  const elements = await page.evaluate(() => {
-    const items = [];
-    document.querySelectorAll('a[href]').forEach((el, i) => {
-      if (i < 10 && el.innerText?.trim()) items.push({ type: 'link', text: el.innerText.trim().substring(0, 80), href: el.href });
-    });
-    document.querySelectorAll('input, textarea').forEach((el, i) => {
-      if (i < 5) items.push({ type: 'input', name: el.name || el.placeholder || el.type, selector: el.id ? `#${el.id}` : `input[name="${el.name}"]` });
-    });
-    return items;
-  }).catch(() => []);
+    // Screenshot
+    const screenshotBuffer = await page.screenshot({ type: 'jpeg', quality: 60 });
+    const key = `browse/${req.userId}/${Date.now()}.jpg`;
+    await s3Client.send(new PutObjectCommand({
+      Bucket: process.env.R2_BUCKET_NAME, Key: key, Body: screenshotBuffer, ContentType: 'image/jpeg',
+    }));
 
-  return {
-    screenshot_url: `${proto}://${host}/api/files/${key}`,
-    page_title: await page.title().catch(() => ''),
-    current_url: page.url(),
-    text_content: pageText,
-    elements,
-  };
+    // Extract text
+    const pageText = await page.evaluate(() => {
+      const clone = document.body.cloneNode(true);
+      clone.querySelectorAll('script, style, noscript, svg').forEach(el => el.remove());
+      return (clone.innerText || '').substring(0, 3000);
+    }).catch(() => '');
+
+    // Extract elements
+    const elements = await page.evaluate(() => {
+      const items = [];
+      document.querySelectorAll('a[href]').forEach((el, i) => {
+        if (i < 10 && el.innerText?.trim()) items.push({ type: 'link', text: el.innerText.trim().substring(0, 80), href: el.href });
+      });
+      document.querySelectorAll('input, textarea').forEach((el, i) => {
+        if (i < 5) items.push({ type: 'input', name: el.name || el.placeholder || el.type, selector: el.id ? `#${el.id}` : `input[name="${el.name}"]` });
+      });
+      return items;
+    }).catch(() => []);
+
+    return {
+      screenshot_url: `${process.env.PUBLIC_BASE_URL || 'https://askcore.dev'}/api/files/${key}`,
+      page_title: await page.title().catch(() => ''),
+      current_url: page.url(),
+      text_content: pageText,
+      elements,
+    };
+  } finally {
+    if (context && typeof context.close === 'function') {
+      await context.close().catch(() => {});
+    }
+  }
 }
 // --- End browse helpers ---
 
 const getSystemPrompt = (model, tools = []) => {
-  let base = 'Jawab dalam Bahasa Indonesia kecuali user meminta bahasa lain. Gunakan format markdown jika diperlukan. Jika user melampirkan file (gambar, PDF, kode, dll), isi file tersebut sudah diekstrak dan disertakan langsung di dalam pesan user. Kamu BISA membaca dan menganalisis konten file tersebut.';
+  let base = `Jawab dalam Bahasa Indonesia kecuali user meminta bahasa lain. Gunakan format markdown jika diperlukan. Jika user melampirkan file (gambar, PDF, kode, dll), isi file tersebut sudah diekstrak dan disertakan langsung di dalam pesan user. Kamu BISA membaca dan menganalisis konten file tersebut.
+
+FORMAT MATEMATIKA:
+- Tulis persamaan inline dengan delimiter LaTeX $...$.
+- Tulis persamaan yang berdiri sendiri dengan delimiter LaTeX display pada baris terpisah: $$ lalu persamaan lalu $$.
+- Gunakan sintaks LaTeX seperti \\frac, \\sqrt, \\sum, \\times, \\mod, subscript _, dan superscript ^.
+- JANGAN bungkus rumus matematika dalam fenced code block atau backtick.
+- Gunakan fenced code block hanya untuk kode program atau pseudocode.`;
 
   if (model && model.includes('image')) {
     base += ' Kamu memiliki kemampuan menghasilkan gambar. Jika user meminta gambar, langsung generate gambar sesuai permintaan tanpa menolak.';
@@ -298,7 +442,7 @@ router.get('/:chatId/messages', async (req, res) => {
       [req.params.chatId, req.userId]
     );
     if (chat.rows.length === 0) {
-      return res.status(404).json({ error: 'Chat not found' });
+      return sendError(res, req, 404, 'Chat not found');
     }
 
     const result = await pool.query(
@@ -309,8 +453,7 @@ router.get('/:chatId/messages', async (req, res) => {
     );
     res.json(result.rows);
   } catch (err) {
-    console.error('Get messages error:', err);
-    res.status(500).json({ error: 'Server error' });
+    return sendError(res, req, 500, 'Server error', err);
   }
 });
 
@@ -318,7 +461,7 @@ router.get('/:chatId/messages', async (req, res) => {
 router.put('/:chatId/messages/:messageId', async (req, res) => {
   const { content } = req.body;
   if (!content || !content.trim()) {
-    return res.status(400).json({ error: 'Content required' });
+    return sendError(res, req, 400, 'Content required', null, 'CONTENT_REQUIRED');
   }
   try {
     const chat = await pool.query(
@@ -326,19 +469,18 @@ router.put('/:chatId/messages/:messageId', async (req, res) => {
       [req.params.chatId, req.userId]
     );
     if (chat.rows.length === 0) {
-      return res.status(404).json({ error: 'Chat not found' });
+      return sendError(res, req, 404, 'Chat not found');
     }
     const result = await pool.query(
       `UPDATE messages SET content = $1 WHERE id = $2 AND chat_id = $3 AND role = 'user' RETURNING *`,
       [content.trim(), req.params.messageId, req.params.chatId]
     );
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Message not found or not editable' });
+      return sendError(res, req, 404, 'Message not found or not editable', null, 'MESSAGE_NOT_EDITABLE');
     }
     res.json(result.rows[0]);
   } catch (err) {
-    console.error('Edit message error:', err);
-    res.status(500).json({ error: 'Server error' });
+    return sendError(res, req, 500, 'Server error', err);
   }
 });
 
@@ -347,7 +489,7 @@ router.post('/:chatId/messages', async (req, res) => {
   const { content, file_url, file_name, file_urls, file_names, tools } = req.body;
 
   if (!content || !content.trim()) {
-    return res.status(400).json({ error: 'Content required' });
+    return sendError(res, req, 400, 'Content required', null, 'CONTENT_REQUIRED');
   }
 
   // Support both single and multi file (backward compat)
@@ -361,10 +503,18 @@ router.post('/:chatId/messages', async (req, res) => {
       [req.params.chatId, req.userId]
     );
     if (chat.rows.length === 0) {
-      return res.status(404).json({ error: 'Chat not found' });
+      return sendError(res, req, 404, 'Chat not found');
     }
 
     const model = chat.rows[0].model;
+    const modelInfo = assertValidModel(model);
+    await assertQuota(req.userId, 'ai_request', 1);
+    if (tools && tools.includes('browse_web')) {
+      await assertQuota(req.userId, 'browse_request', 1);
+    }
+    if (modelInfo.supports_image_generation) {
+      await assertQuota(req.userId, 'image_generation', 1);
+    }
 
     // Save user message (store first file for backward compat in DB)
     await pool.query(
@@ -387,9 +537,10 @@ router.post('/:chatId/messages', async (req, res) => {
 
     // Helper: read file from R2 as buffer
     const readFileFromR2 = async (key) => {
+      const safeKey = await assertCanReadR2Key(req.userId, key);
       const obj = await s3Client.send(new GetObjectCommand({
         Bucket: process.env.R2_BUCKET_NAME,
-        Key: key,
+        Key: safeKey,
       }));
       const chunks = [];
       for await (const chunk of obj.Body) chunks.push(chunk);
@@ -403,7 +554,12 @@ router.post('/:chatId/messages', async (req, res) => {
     for (let i = 0; i < urls.length; i++) {
       const fileUrl = urls[i];
       const fileName = names[i] || 'file';
-      console.log(`[FILE ${i + 1}/${urls.length}] file_url:`, fileUrl, 'file_name:', fileName);
+      logger.info('message_attachment_received', {
+        request_id: req.requestId,
+        index: i + 1,
+        total: urls.length,
+        file_name: fileName,
+      });
 
       if (!fileUrl || !fileName) continue;
 
@@ -451,10 +607,16 @@ router.post('/:chatId/messages', async (req, res) => {
           }
         }
       } catch (fileErr) {
-        console.error(`[FILE ERROR ${i}]`, fileErr.message);
+        metrics.inc('attachment_read_failures_total', { ext: ext || 'unknown' });
+        logger.warn('message_attachment_read_failed', {
+          request_id: req.requestId,
+          index: i + 1,
+          file_name: fileName,
+          error: fileErr.message,
+        });
         const lastMsg = allMessages[allMessages.length - 1];
         if (lastMsg && lastMsg.role === 'user') {
-          lastMsg.content += `\n\n[File terlampir: ${fileName} - Error: ${fileErr.message}]`;
+          lastMsg.content += `\n\n[File terlampir: ${fileName} - tidak dapat dibaca atau tidak ditemukan]`;
         }
       }
     }
@@ -486,14 +648,7 @@ router.post('/:chatId/messages', async (req, res) => {
       res.setHeader('X-Accel-Buffering', 'no');
       res.flushHeaders();
 
-      const aiResponse = await fetch(`${process.env.AI_BASE_URL}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${process.env.AI_API_KEY}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ model, messages, stream: true }),
-      });
+      const aiResponse = await fetchAI({ model, messages, stream: true });
 
       if (!aiResponse.ok) {
         const errData = await aiResponse.json().catch(() => ({}));
@@ -518,7 +673,9 @@ router.post('/:chatId/messages', async (req, res) => {
 
           try {
             const parsed = JSON.parse(data);
-            const delta = parsed.choices?.[0]?.delta?.content || '';
+            const delta = parsed.type === 'content_block_delta'
+              ? (parsed.delta?.text || '')
+              : (parsed.choices?.[0]?.delta?.content || '');
             if (delta) {
               fullContent += delta;
               res.write(`data: ${JSON.stringify({ token: delta })}\n\n`);
@@ -547,17 +704,11 @@ router.post('/:chatId/messages', async (req, res) => {
 
       if (chatTitleUpdated) {
         try {
-          const titleResponse = await fetch(`${process.env.AI_BASE_URL}/chat/completions`, {
-            method: 'POST',
-            headers: {
-              Authorization: `Bearer ${process.env.AI_API_KEY}`,
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              model: 'gemini-2.5-flash-lite',
-              messages: [{ role: 'user', content: `Buatkan judul singkat (maksimal 5 kata, tanpa tanda kutip) untuk percakapan yang dimulai dengan pesan ini: "${content}"` }],
-              stream: false,
-            }),
+          const titleResponse = await fetchAI({
+            model: TITLE_MODEL,
+            messages: [{ role: 'user', content: `Buatkan judul singkat (maksimal 5 kata, tanpa tanda kutip) untuk percakapan yang dimulai dengan pesan ini: "${content}"` }],
+            stream: false,
+            max_tokens: 50,
           });
           if (titleResponse.ok) {
             const titleData = await titleResponse.json();
@@ -571,6 +722,8 @@ router.post('/:chatId/messages', async (req, res) => {
         await pool.query('UPDATE chats SET updated_at = NOW() WHERE id = $1', [req.params.chatId]);
       }
 
+      await recordUsage(req.userId, 'ai_request', 1, { model, stream: true });
+
       // Send final metadata
       res.write(`data: ${JSON.stringify({ done: true, message: saved.rows[0], chat_title_updated: chatTitleUpdated })}\n\n`);
       res.write('data: [DONE]\n\n');
@@ -578,14 +731,7 @@ router.post('/:chatId/messages', async (req, res) => {
     }
 
     // === NON-STREAMING MODE (browse + fallback) ===
-    const aiResponse = await fetch(`${process.env.AI_BASE_URL}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${process.env.AI_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ model, messages, stream: false }),
-    });
+    const aiResponse = await fetchAI({ model, messages, stream: false });
 
     if (!aiResponse.ok) {
       const errData = await aiResponse.json().catch(() => ({}));
@@ -619,20 +765,17 @@ router.post('/:chatId/messages', async (req, res) => {
                 : '');
 
           if (userText && userText.length > 2) {
-            console.log('[BROWSE] AI skipped search, forcing fallback search for:', userText.substring(0, 80));
+            logger.info('browse_fallback_search', { request_id: req.requestId });
             const searchResult = await executeSearch(userText.substring(0, 150));
             if (searchResult.resultCount > 0) {
               // Feed search results to AI and ask it to answer based on results
               browseMessages.push({ role: 'assistant', content: currentResponse });
               browseMessages.push({ role: 'user', content: `[Hasil pencarian otomatis]\n\n${searchResult.text}\n\nGunakan hasil pencarian di atas untuk menjawab pertanyaan sebelumnya dengan informasi terkini. Jika ingin membuka URL tertentu untuk detail lebih, gunakan [BROWSE:url].` });
 
-              const retryResponse = await fetch(`${process.env.AI_BASE_URL}/chat/completions`, {
-                method: 'POST',
-                headers: {
-                  Authorization: `Bearer ${process.env.AI_API_KEY}`,
-                  'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({ model, messages: browseMessages, stream: false }),
+              const retryResponse = await fetchAI({
+                model,
+                messages: browseMessages,
+                stream: false,
               });
               if (retryResponse.ok) {
                 const retryData = await retryResponse.json();
@@ -648,7 +791,11 @@ router.post('/:chatId/messages', async (req, res) => {
 
         if (commands.length === 0) break;
 
-        console.log(`[BROWSE] Step ${step + 1}: ${commands.length} command(s)`);
+        logger.info('browse_step', {
+          request_id: req.requestId,
+          step: step + 1,
+          command_count: commands.length,
+        });
 
         // Execute each command
         let browseResults = [];
@@ -703,13 +850,10 @@ router.post('/:chatId/messages', async (req, res) => {
         browseMessages.push({ role: 'user', content: `[Hasil browsing otomatis - gunakan informasi ini untuk menjawab]\n\n${browseContext}` });
 
         // Re-call AI with browse results
-        const followUp = await fetch(`${process.env.AI_BASE_URL}/chat/completions`, {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${process.env.AI_API_KEY}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({ model, messages: browseMessages, stream: false }),
+        const followUp = await fetchAI({
+          model,
+          messages: browseMessages,
+          stream: false,
         });
 
         if (!followUp.ok) break;
@@ -750,38 +894,65 @@ router.post('/:chatId/messages', async (req, res) => {
     // Handle image generation: router returns images in message.images[]
     const images = aiMsg?.images;
     if (images && Array.isArray(images) && images.length > 0) {
-      const { PutObjectCommand } = require('@aws-sdk/client-s3');
       const { v4: uuidv4 } = require('uuid');
       const contentParts = [];
 
       if (aiContent) contentParts.push(aiContent);
 
       for (const img of images) {
-        const dataUrl = img.image_url?.url || img.url || '';
-        if (!dataUrl.startsWith('data:')) continue;
-
-        const match = dataUrl.match(/^data:(image\/\w+);base64,(.+)$/s);
-        if (!match) continue;
-
-        const mimeType = match[1];
-        const base64Data = match[2];
-        const ext = mimeType.split('/')[1] || 'png';
-        const key = `generated/${req.userId}/${uuidv4()}.${ext}`;
+        const imageUrl = img.image_url?.url || img.url || '';
+        let mimeType;
+        let buffer;
 
         try {
-          const buffer = Buffer.from(base64Data, 'base64');
-          await getS3().send(new PutObjectCommand({
+          if (imageUrl.startsWith('data:')) {
+            const match = imageUrl.match(/^data:(image\/\w+);base64,(.+)$/s);
+            if (!match) continue;
+            mimeType = match[1];
+            buffer = Buffer.from(match[2], 'base64');
+          } else if (imageUrl.startsWith('https://')) {
+            const imageResponse = await fetch(imageUrl);
+            if (!imageResponse.ok) {
+              throw new Error(`Image download failed: HTTP ${imageResponse.status}`);
+            }
+            mimeType = imageResponse.headers.get('content-type')?.split(';')[0] || 'image/png';
+            if (!mimeType.startsWith('image/')) {
+              throw new Error(`Unexpected image content type: ${mimeType}`);
+            }
+            buffer = Buffer.from(await imageResponse.arrayBuffer());
+          } else {
+            continue;
+          }
+
+          if (buffer.length > 20 * 1024 * 1024) {
+            throw new Error('Generated image exceeds 20MB');
+          }
+
+          const ext = mimeType.split('/')[1] || 'png';
+          const key = `generated/${req.userId}/${uuidv4()}.${ext}`;
+
+          await s3Client.send(new PutObjectCommand({
             Bucket: process.env.R2_BUCKET_NAME,
             Key: key,
             Body: buffer,
             ContentType: mimeType,
           }));
-          const proto = req.get('x-forwarded-proto') || req.protocol;
-          const host = req.get('x-forwarded-host') || req.get('host');
-          const baseUrl = `${proto}://${host}`;
+          await recordFile({
+            ownerId: req.userId,
+            key,
+            fileName: `generated.${ext}`,
+            contentType: mimeType,
+            size: buffer.length,
+            visibility: 'public',
+          });
+          const baseUrl = process.env.PUBLIC_BASE_URL || 'https://askcore.dev';
           contentParts.push(`![Generated Image](${baseUrl}/api/files/${key})`);
         } catch (uploadErr) {
-          console.error('Image upload to R2 error:', uploadErr);
+          metrics.inc('upload_failures_total', { code: 'GENERATED_IMAGE_SAVE_FAILED' });
+          logger.warn('generated_image_save_failed', {
+            request_id: req.requestId,
+            error: uploadErr.message,
+          });
           contentParts.push('[Gambar berhasil dibuat tapi gagal disimpan]');
         }
       }
@@ -806,26 +977,17 @@ router.post('/:chatId/messages', async (req, res) => {
     if (msgCount <= 1) {
       // First message — generate title
       try {
-        const titleResponse = await fetch(
-          `${process.env.AI_BASE_URL}/chat/completions`,
-          {
-            method: 'POST',
-            headers: {
-              Authorization: `Bearer ${process.env.AI_API_KEY}`,
-              'Content-Type': 'application/json',
+        const titleResponse = await fetchAI({
+          model: TITLE_MODEL,
+          messages: [
+            {
+              role: 'user',
+              content: `Buatkan judul singkat (maksimal 5 kata, tanpa tanda kutip) untuk percakapan yang dimulai dengan pesan ini: "${content}"`,
             },
-            body: JSON.stringify({
-              model: 'gemini-2.5-flash-lite',
-              messages: [
-                {
-                  role: 'user',
-                  content: `Buatkan judul singkat (maksimal 5 kata, tanpa tanda kutip) untuk percakapan yang dimulai dengan pesan ini: "${content}"`,
-                },
-              ],
-              stream: false,
-            }),
-          }
-        );
+          ],
+          stream: false,
+          max_tokens: 50,
+        });
         if (titleResponse.ok) {
           const titleData = await titleResponse.json();
           const title =
@@ -851,13 +1013,38 @@ router.post('/:chatId/messages', async (req, res) => {
       );
     }
 
+    await recordUsage(req.userId, 'ai_request', 1, { model, stream: false });
+    if (tools && tools.includes('browse_web')) {
+      await recordUsage(req.userId, 'browse_request', 1, { model, via: 'messages' });
+    }
+    if (modelInfo.supports_image_generation) {
+      await recordUsage(req.userId, 'image_generation', 1, { model });
+    }
+
     res.json({
       message: saved.rows[0],
       chat_title_updated: msgCount <= 1,
     });
   } catch (err) {
-    console.error('Send message error:', err);
-    res.status(500).json({ error: err.message || 'Server error' });
+    logger.error('message_failed', {
+      request_id: req.requestId,
+      code: err.code || 'MESSAGE_FAILED',
+      error: err.message || String(err),
+    });
+    if (!res.headersSent) {
+      return sendError(res, req, err.statusCode || 500, err.message || 'Message failed', err);
+    }
+    try {
+      res.write(`data: ${JSON.stringify({ error: 'Message failed', request_id: req.requestId })}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
+    } catch (e) {
+      metrics.inc('sse_failures_total', { code: 'STREAM_CLOSE_FAILED' });
+      logger.error('stream_close_failed', {
+        request_id: req.requestId,
+        error: e.message || String(e),
+      });
+    }
   }
 });
 

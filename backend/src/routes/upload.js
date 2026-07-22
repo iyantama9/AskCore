@@ -3,6 +3,10 @@ const multer = require('multer');
 const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { v4: uuidv4 } = require('uuid');
 const authMiddleware = require('../middleware/auth');
+const { recordFile, assertCanReadR2Key } = require('../utils/files');
+const { sendError } = require('../utils/errors');
+const { assertQuota, recordUsage } = require('../utils/usage');
+const metrics = require('../utils/metrics');
 
 const router = express.Router();
 router.use(authMiddleware);
@@ -26,13 +30,16 @@ const s3 = new S3Client({
 // Upload file
 router.post('/', upload.single('file'), async (req, res) => {
   if (!req.file) {
-    return res.status(400).json({ error: 'No file provided' });
+    return sendError(res, req, 400, 'No file provided', null, 'FILE_REQUIRED');
   }
 
   const ext = req.file.originalname.split('.').pop();
   const key = `uploads/${req.userId}/${uuidv4()}.${ext}`;
 
   try {
+    await assertQuota(req.userId, 'upload_count', 1);
+    await assertQuota(req.userId, 'upload_bytes', req.file.size);
+
     await s3.send(
       new PutObjectCommand({
         Bucket: process.env.R2_BUCKET_NAME,
@@ -42,34 +49,48 @@ router.post('/', upload.single('file'), async (req, res) => {
       })
     );
 
+    const file = await recordFile({
+      ownerId: req.userId,
+      key,
+      fileName: req.file.originalname,
+      contentType: req.file.mimetype,
+      size: req.file.size,
+      visibility: 'private',
+    });
+
+    await recordUsage(req.userId, 'upload_count', 1, { file_id: file.id });
+    await recordUsage(req.userId, 'upload_bytes', req.file.size, { file_id: file.id });
+
     res.json({
+      id: file.id,
       key,
       file_name: req.file.originalname,
       size: req.file.size,
       content_type: req.file.mimetype,
     });
   } catch (err) {
-    console.error('Upload error:', err);
-    res.status(500).json({ error: 'Upload failed' });
+    metrics.inc('upload_failures_total', { code: err.code || 'UPLOAD_FAILED' });
+    return sendError(res, req, err.statusCode || 500, 'Upload failed', err);
   }
 });
 
-// Download file (proxy from R2)
+// Download private file (proxy from R2)
 router.get('/:key(*)', async (req, res) => {
   try {
+    const key = await assertCanReadR2Key(req.userId, req.params.key);
     const result = await s3.send(
       new GetObjectCommand({
         Bucket: process.env.R2_BUCKET_NAME,
-        Key: req.params.key,
+        Key: key,
       })
     );
 
     res.set('Content-Type', result.ContentType || 'application/octet-stream');
-    res.set('Content-Disposition', `inline; filename="${req.params.key.split('/').pop()}"`);
+    res.set('X-Content-Type-Options', 'nosniff');
+    res.set('Content-Disposition', `attachment; filename="${key.split('/').pop()}"`);
     result.Body.pipe(res);
   } catch (err) {
-    console.error('Download error:', err);
-    res.status(404).json({ error: 'File not found' });
+    return sendError(res, req, err.statusCode || 404, 'File not found', err);
   }
 });
 

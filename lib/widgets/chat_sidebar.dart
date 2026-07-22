@@ -48,10 +48,12 @@ class _ChatSidebarState extends State<ChatSidebar> {
       setState(() => _isSearching = true);
       try {
         final results = await ApiService().searchChats(query.trim());
-        if (mounted) setState(() {
-          _searchResults = results;
-          _isSearching = false;
-        });
+        if (mounted) {
+          setState(() {
+            _searchResults = results;
+            _isSearching = false;
+          });
+        }
       } catch (_) {
         if (mounted) setState(() => _isSearching = false);
       }
@@ -85,97 +87,112 @@ class _ChatSidebarState extends State<ChatSidebar> {
           : const Color(0xFFF5F3FF),
       child: SafeArea(
         child: Column(
-        children: [
-          // Header
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
-            child: SizedBox(
-              width: double.infinity,
-              height: 48,
-              child: ElevatedButton.icon(
-                onPressed: widget.onNewChat,
-                icon: const Icon(Icons.add_rounded, size: 20),
-                label: const Text('New Chat'),
-                style: ElevatedButton.styleFrom(
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(14),
+          children: [
+            // Header
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+              child: SizedBox(
+                width: double.infinity,
+                height: 48,
+                child: ElevatedButton.icon(
+                  onPressed: widget.onNewChat,
+                  icon: const Icon(Icons.add_rounded, size: 20),
+                  label: const Text('New Chat'),
+                  style: ElevatedButton.styleFrom(
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(14),
+                    ),
                   ),
                 ),
               ),
             ),
-          ),
-          const SizedBox(height: 4),
-          // Search bar
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-            child: TextField(
-              controller: _searchController,
-              onChanged: _onSearchChanged,
-              decoration: InputDecoration(
-                hintText: 'Search chats...',
-                prefixIcon: const Icon(Icons.search_rounded, size: 18),
-                suffixIcon: _searchQuery.isNotEmpty
-                    ? IconButton(
-                        icon: const Icon(Icons.close_rounded, size: 16),
-                        onPressed: () {
-                          _searchController.clear();
-                          _onSearchChanged('');
-                        },
-                      )
-                    : null,
-                isDense: true,
-                contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(10),
-                  borderSide: BorderSide(color: theme.colorScheme.outline.withValues(alpha: 0.2)),
+            const SizedBox(height: 4),
+            // Search bar
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+              child: TextField(
+                controller: _searchController,
+                onChanged: _onSearchChanged,
+                decoration: InputDecoration(
+                  hintText: 'Search chats...',
+                  prefixIcon: const Icon(Icons.search_rounded, size: 18),
+                  suffixIcon: _searchQuery.isNotEmpty
+                      ? IconButton(
+                          icon: const Icon(Icons.close_rounded, size: 16),
+                          onPressed: () {
+                            _searchController.clear();
+                            _onSearchChanged('');
+                          },
+                        )
+                      : null,
+                  isDense: true,
+                  contentPadding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 10,
+                  ),
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(10),
+                    borderSide: BorderSide(
+                      color: theme.colorScheme.outline.withValues(alpha: 0.2),
+                    ),
+                  ),
+                  enabledBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(10),
+                    borderSide: BorderSide(
+                      color: theme.colorScheme.outline.withValues(alpha: 0.2),
+                    ),
+                  ),
+                  filled: true,
+                  fillColor: theme.colorScheme.surface,
                 ),
-                enabledBorder: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(10),
-                  borderSide: BorderSide(color: theme.colorScheme.outline.withValues(alpha: 0.2)),
-                ),
-                filled: true,
-                fillColor: theme.colorScheme.surface,
+                style: theme.textTheme.bodySmall,
               ),
-              style: theme.textTheme.bodySmall,
             ),
-          ),
-          const SizedBox(height: 4),
-          // Chat list
-          Expanded(
-            child: Builder(builder: (context) {
-              // Apply filter
-              final displayChats = _searchQuery.isNotEmpty && _searchResults != null
-                  ? _searchResults!
-                  : _searchQuery.isNotEmpty
+            const SizedBox(height: 4),
+            // Chat list
+            Expanded(
+              child: Builder(
+                builder: (context) {
+                  // Apply filter
+                  final displayChats =
+                      _searchQuery.isNotEmpty && _searchResults != null
+                      ? _searchResults!
+                      : _searchQuery.isNotEmpty
                       ? widget.chats.where((c) {
-                          final title = (c['title'] ?? '').toString().toLowerCase();
+                          final title = (c['title'] ?? '')
+                              .toString()
+                              .toLowerCase();
                           return title.contains(_searchQuery.toLowerCase());
                         }).toList()
                       : widget.chats;
 
-              if (_isSearching) {
-                return const Center(child: CircularProgressIndicator(strokeWidth: 2));
-              }
+                  if (_isSearching) {
+                    return const Center(
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    );
+                  }
 
-              if (displayChats.isEmpty) {
-                return Center(
-                    child: Padding(
-                      padding: const EdgeInsets.all(24),
-                      child: Text(
-                        _searchQuery.isNotEmpty
-                            ? 'No results found'
-                            : 'No chats yet.\nTap "New Chat" to start!',
-                        textAlign: TextAlign.center,
-                        style: theme.textTheme.bodyMedium?.copyWith(
-                          color: theme.colorScheme.onSurfaceVariant,
+                  if (displayChats.isEmpty) {
+                    return Center(
+                      child: Padding(
+                        padding: const EdgeInsets.all(24),
+                        child: Text(
+                          _searchQuery.isNotEmpty
+                              ? 'No results found'
+                              : 'No chats yet.\nTap "New Chat" to start!',
+                          textAlign: TextAlign.center,
+                          style: theme.textTheme.bodyMedium?.copyWith(
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
                         ),
                       ),
-                    ),
-                  );
-              }
-              return ListView.builder(
+                    );
+                  }
+                  return ListView.builder(
                     padding: const EdgeInsets.symmetric(
-                        horizontal: 8, vertical: 4),
+                      horizontal: 8,
+                      vertical: 4,
+                    ),
                     itemCount: displayChats.length,
                     itemBuilder: (context, index) {
                       final chat = displayChats[index];
@@ -194,11 +211,14 @@ class _ChatSidebarState extends State<ChatSidebar> {
                             child: AnimatedContainer(
                               duration: const Duration(milliseconds: 150),
                               padding: const EdgeInsets.symmetric(
-                                  horizontal: 12, vertical: 10),
+                                horizontal: 12,
+                                vertical: 10,
+                              ),
                               decoration: BoxDecoration(
                                 color: isSelected
-                                    ? theme.colorScheme.primary
-                                        .withValues(alpha: 0.15)
+                                    ? theme.colorScheme.primary.withValues(
+                                        alpha: 0.15,
+                                      )
                                     : Colors.transparent,
                                 borderRadius: BorderRadius.circular(12),
                               ),
@@ -218,12 +238,12 @@ class _ChatSidebarState extends State<ChatSidebar> {
                                             controller: _editController,
                                             autofocus: true,
                                             style: theme.textTheme.bodySmall,
-                                            decoration:
-                                                const InputDecoration(
+                                            decoration: const InputDecoration(
                                               isDense: true,
                                               contentPadding:
                                                   EdgeInsets.symmetric(
-                                                      vertical: 4),
+                                                    vertical: 4,
+                                                  ),
                                               border: InputBorder.none,
                                             ),
                                             onSubmitted: (_) =>
@@ -235,14 +255,17 @@ class _ChatSidebarState extends State<ChatSidebar> {
                                             overflow: TextOverflow.ellipsis,
                                             style: theme.textTheme.bodySmall
                                                 ?.copyWith(
-                                              fontWeight: isSelected
-                                                  ? FontWeight.w600
-                                                  : FontWeight.w400,
-                                              color: isSelected
-                                                  ? theme.colorScheme.primary
-                                                  : theme.colorScheme
-                                                      .onSurface,
-                                            ),
+                                                  fontWeight: isSelected
+                                                      ? FontWeight.w600
+                                                      : FontWeight.w400,
+                                                  color: isSelected
+                                                      ? theme
+                                                            .colorScheme
+                                                            .primary
+                                                      : theme
+                                                            .colorScheme
+                                                            .onSurface,
+                                                ),
                                           ),
                                   ),
                                   if (isSelected && !isEditing)
@@ -254,15 +277,16 @@ class _ChatSidebarState extends State<ChatSidebar> {
                                             chatId,
                                             chat['title'] ?? '',
                                           ),
-                                          borderRadius:
-                                              BorderRadius.circular(6),
+                                          borderRadius: BorderRadius.circular(
+                                            6,
+                                          ),
                                           child: Padding(
-                                            padding:
-                                                const EdgeInsets.all(4),
+                                            padding: const EdgeInsets.all(4),
                                             child: Icon(
                                               Icons.edit_rounded,
                                               size: 14,
-                                              color: theme.colorScheme
+                                              color: theme
+                                                  .colorScheme
                                                   .onSurfaceVariant,
                                             ),
                                           ),
@@ -270,16 +294,17 @@ class _ChatSidebarState extends State<ChatSidebar> {
                                         InkWell(
                                           onTap: () =>
                                               widget.onDeleteChat(chatId),
-                                          borderRadius:
-                                              BorderRadius.circular(6),
+                                          borderRadius: BorderRadius.circular(
+                                            6,
+                                          ),
                                           child: Padding(
-                                            padding:
-                                                const EdgeInsets.all(4),
+                                            padding: const EdgeInsets.all(4),
                                             child: Icon(
                                               Icons.delete_outline_rounded,
                                               size: 14,
-                                              color: Colors.red
-                                                  .withValues(alpha: 0.7),
+                                              color: Colors.red.withValues(
+                                                alpha: 0.7,
+                                              ),
                                             ),
                                           ),
                                         ),
@@ -293,52 +318,53 @@ class _ChatSidebarState extends State<ChatSidebar> {
                       );
                     },
                   );
-            }),
-          ),
-          // User info + logout
-          Container(
-            padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(
-              border: Border(
-                top: BorderSide(
-                  color: theme.colorScheme.outline.withValues(alpha: 0.2),
-                ),
+                },
               ),
             ),
-            child: Row(
-              children: [
-                CircleAvatar(
-                  radius: 16,
-                  backgroundColor: theme.colorScheme.primary,
-                  child: Text(
-                    widget.username[0].toUpperCase(),
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 14,
-                      fontWeight: FontWeight.w600,
-                    ),
+            // User info + logout
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                border: Border(
+                  top: BorderSide(
+                    color: theme.colorScheme.outline.withValues(alpha: 0.2),
                   ),
                 ),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: Text(
-                    widget.username,
-                    style: theme.textTheme.bodySmall?.copyWith(
-                      fontWeight: FontWeight.w600,
+              ),
+              child: Row(
+                children: [
+                  CircleAvatar(
+                    radius: 16,
+                    backgroundColor: theme.colorScheme.primary,
+                    child: Text(
+                      widget.username[0].toUpperCase(),
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 14,
+                        fontWeight: FontWeight.w600,
+                      ),
                     ),
                   ),
-                ),
-                IconButton(
-                  onPressed: widget.onLogout,
-                  icon: const Icon(Icons.logout_rounded, size: 18),
-                  tooltip: 'Logout',
-                  iconSize: 18,
-                ),
-              ],
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      widget.username,
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    onPressed: widget.onLogout,
+                    icon: const Icon(Icons.logout_rounded, size: 18),
+                    tooltip: 'Logout',
+                    iconSize: 18,
+                  ),
+                ],
+              ),
             ),
-          ),
-        ],
-      ),
+          ],
+        ),
       ),
     );
   }
