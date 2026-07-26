@@ -1,64 +1,59 @@
-// ignore_for_file: avoid_web_libraries_in_flutter, deprecated_member_use
-
-// Web-specific clipboard image paste support
-// This file uses dart:html which is only available on web
-import 'dart:async';
-import 'dart:html' as html;
+// Web-specific clipboard image paste support, implemented with package:web
+// + dart:js_interop so it compiles under both dart2js and dart2wasm.
+import 'dart:js_interop';
 import 'dart:typed_data';
+
+import 'package:web/web.dart' as web;
 
 typedef OnImagePasted = Future<void> Function(Uint8List bytes, String mimeType);
 
-StreamSubscription<html.Event>? _pasteSubscription;
+JSFunction? _pasteHandler;
 
 /// Sets up a global paste listener for web.
 void setupWebPasteListener(OnImagePasted onImagePasted) {
-  _pasteSubscription?.cancel();
-  _pasteSubscription = html.document.onPaste.listen((html.Event event) async {
-    final clipboardData = (event as dynamic).clipboardData;
-    if (clipboardData == null) return;
+  disposeWebPasteListener();
+  void handler(web.Event event) {
+    _handlePaste(event, onImagePasted);
+  }
 
-    final items = clipboardData.items;
-    if (items == null) return;
+  final jsHandler = handler.toJS;
+  _pasteHandler = jsHandler;
+  web.document.addEventListener('paste', jsHandler);
+}
 
-    final int length = items.length as int;
-    for (int i = 0; i < length; i++) {
-      final item = items[i];
-      final String type = item.type as String;
-      if (type.startsWith('image/')) {
-        event.preventDefault();
-        final blob = item.getAsFile();
-        if (blob == null) continue;
+void _handlePaste(web.Event event, OnImagePasted onImagePasted) {
+  final clipboardData = (event as web.ClipboardEvent).clipboardData;
+  if (clipboardData == null) return;
 
-        final reader = html.FileReader();
-        final completer = Completer<Uint8List>();
+  final files = clipboardData.files;
+  for (var i = 0; i < files.length; i++) {
+    final file = files.item(i);
+    if (file == null) continue;
+    final type = file.type;
+    if (!type.startsWith('image/')) continue;
 
-        reader.onLoad.listen((_) {
-          final result = reader.result;
-          if (result is Uint8List) {
-            completer.complete(result);
-          } else if (result is List<int>) {
-            completer.complete(Uint8List.fromList(result));
-          } else {
-            completer.completeError('Unexpected result type');
-          }
-        });
-        reader.onError.listen((_) {
-          completer.completeError('Failed to read pasted image');
-        });
-        reader.readAsArrayBuffer(blob);
+    event.preventDefault();
+    _readAndDeliver(file, type, onImagePasted);
+    break; // Only handle first image
+  }
+}
 
-        try {
-          final bytes = await completer.future;
-          await onImagePasted(bytes, type);
-        } catch (_) {}
-        break; // Only handle first image
-      }
-    }
-  });
+Future<void> _readAndDeliver(
+  web.File file,
+  String type,
+  OnImagePasted onImagePasted,
+) async {
+  try {
+    final buffer = await file.arrayBuffer().toDart;
+    await onImagePasted(buffer.toDart.asUint8List(), type);
+  } catch (_) {}
 }
 
 /// Removes the paste listener
 void disposeWebPasteListener() {
-  _pasteSubscription?.cancel();
-  _pasteSubscription = null;
+  final handler = _pasteHandler;
+  if (handler != null) {
+    web.document.removeEventListener('paste', handler);
+    _pasteHandler = null;
+  }
 }
