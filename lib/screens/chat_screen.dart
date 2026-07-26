@@ -3,15 +3,17 @@ import 'package:flutter/services.dart';
 import '../helpers/clipboard_paste.dart';
 import '../core/constants.dart';
 import '../main.dart';
+import '../models/artifact_model.dart';
 import '../models/message_model.dart';
 import '../services/api_service.dart';
 import '../services/chat_service.dart';
+import '../widgets/artifact_viewer.dart';
 import '../widgets/chat_input.dart';
 import '../widgets/chat_sidebar.dart';
 import '../widgets/message_bubble.dart';
 import '../widgets/model_selector.dart';
 import '../widgets/welcome_view.dart';
-import 'playground_screen.dart';
+import 'playground_screen.dart' deferred as playground;
 
 class _RetryPayload {
   final String content;
@@ -43,11 +45,21 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
   int? _selectedChatId;
   String _currentModel = AppConstants.defaultModel;
   bool _isLoading = false;
+  bool _isSubmittingFeedback = false;
   bool _sidebarOpen = true;
   _RetryPayload? _lastRetryPayload;
+  final Map<String, _RetryPayload> _retryPayloads = {};
   String? _usageWarning;
+  List<ArtifactSummary> _artifacts = [];
+  ChatArtifact? _activeArtifact;
+  bool _artifactPanelOpen = false;
   // Only animate the LATEST 2 messages (user + assistant)
   final Map<String, AnimationController> _animControllers = {};
+
+  // Streamed tokens flow through this notifier so only the active bubble
+  // rebuilds during streaming; the rest of the screen stays untouched.
+  final ValueNotifier<String> _streamingText = ValueNotifier<String>('');
+  String? _streamingMessageId;
 
   // File attachments (up to 5)
   List<PendingFile> _pendingFiles = [];
@@ -55,8 +67,13 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
   // Active tools
   final Set<ChatTool> _activeTools = {};
 
-  // Reasoning toggle for Claude Sonnet models
+  // Reasoning toggle for Claude models that expose a separate thinking id.
   bool _reasoningEnabled = false;
+
+  static const Map<String, String> _reasoningModelPairs = {
+    'mk/sonnet-4.5': 'mk/sonnet-4.5-thinking',
+    'mk/haiku-4.5': 'mk/haiku-4.5-thinking',
+  };
 
   @override
   void initState() {
@@ -99,35 +116,508 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
 
   void _showErrorSnack(String message) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(message), duration: const Duration(seconds: 4)),
-    );
+    final theme = Theme.of(context);
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          behavior: SnackBarBehavior.floating,
+          backgroundColor: theme.colorScheme.errorContainer,
+          elevation: 10,
+          margin: const EdgeInsets.fromLTRB(16, 0, 16, 96),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16),
+            side: BorderSide(
+              color: theme.colorScheme.error.withValues(alpha: 0.24),
+            ),
+          ),
+          content: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Icon(
+                Icons.warning_amber_rounded,
+                color: theme.colorScheme.onErrorContainer,
+                size: 20,
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  message,
+                  maxLines: 3,
+                  overflow: TextOverflow.ellipsis,
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: theme.colorScheme.onErrorContainer,
+                    fontWeight: FontWeight.w700,
+                    height: 1.35,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          duration: const Duration(seconds: 4),
+        ),
+      );
   }
 
   String _formatError(String message, {String? code, String? requestId}) {
-    final parts = <String>[message];
-    if (code != null && code.isNotEmpty) parts.add('Kode: $code');
-    if (requestId != null && requestId.isNotEmpty) parts.add('ID: $requestId');
-    return '⚠️ ${parts.join('\n')}';
+    final cleanCode = code?.trim();
+    final cleanRequestId = requestId?.trim();
+    final buffer = StringBuffer(message.trim());
+    if (cleanCode != null && cleanCode.isNotEmpty) {
+      buffer.write('\n\nKode: $cleanCode');
+    }
+    if (cleanRequestId != null && cleanRequestId.isNotEmpty) {
+      buffer.write('\nID bantuan: $cleanRequestId');
+    }
+    return buffer.toString();
+  }
+
+  void _showSuccessSnack(String message) {
+    if (!mounted) return;
+    final theme = Theme.of(context);
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          behavior: SnackBarBehavior.floating,
+          backgroundColor: theme.colorScheme.primaryContainer,
+          elevation: 10,
+          margin: const EdgeInsets.fromLTRB(16, 0, 16, 96),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16),
+            side: BorderSide(
+              color: theme.colorScheme.primary.withValues(alpha: 0.24),
+            ),
+          ),
+          content: Row(
+            children: [
+              Icon(
+                Icons.check_circle_outline_rounded,
+                color: theme.colorScheme.onPrimaryContainer,
+                size: 20,
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  message,
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: theme.colorScheme.onPrimaryContainer,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          duration: const Duration(seconds: 3),
+        ),
+      );
+  }
+
+  Future<void> _showFeedbackDialog() async {
+    final controller = TextEditingController();
+    var canSubmit = false;
+
+    try {
+      await showDialog<void>(
+        context: context,
+        builder: (dialogContext) {
+          final theme = Theme.of(dialogContext);
+          return StatefulBuilder(
+            builder: (context, setDialogState) {
+              Future<void> submit() async {
+                final content = controller.text.trim();
+                if (content.isEmpty || _isSubmittingFeedback) return;
+
+                setState(() => _isSubmittingFeedback = true);
+                setDialogState(() {});
+                try {
+                  await _api.submitFeedback(
+                    content,
+                    chatId: _selectedChatId,
+                    model: _currentModel,
+                  );
+                  if (!mounted || !dialogContext.mounted) return;
+                  Navigator.of(dialogContext).pop();
+                  _showSuccessSnack(
+                    'Terima kasih, kritik dan saran berhasil dikirim.',
+                  );
+                } catch (e) {
+                  if (!mounted) return;
+                  final apiError = e is ApiException ? e : null;
+                  _showErrorSnack(
+                    apiError?.supportMessage ??
+                        'Gagal mengirim kritik dan saran. Coba lagi.',
+                  );
+                } finally {
+                  if (mounted) {
+                    setState(() => _isSubmittingFeedback = false);
+                    if (dialogContext.mounted) setDialogState(() {});
+                  }
+                }
+              }
+
+              final isDark = theme.brightness == Brightness.dark;
+              final surface = isDark
+                  ? const Color(0xFF191925)
+                  : theme.colorScheme.surface;
+              final fieldColor = isDark
+                  ? const Color(0xFF24243A)
+                  : theme.colorScheme.surfaceContainerHighest.withValues(
+                      alpha: 0.55,
+                    );
+              final outlineColor = theme.colorScheme.outline.withValues(
+                alpha: isDark ? 0.18 : 0.55,
+              );
+
+              return Dialog(
+                insetPadding: const EdgeInsets.symmetric(
+                  horizontal: 20,
+                  vertical: 24,
+                ),
+                backgroundColor: Colors.transparent,
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 520),
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(
+                      color: surface,
+                      borderRadius: BorderRadius.circular(28),
+                      border: Border.all(color: outlineColor),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withValues(alpha: 0.28),
+                          blurRadius: 34,
+                          offset: const Offset(0, 18),
+                        ),
+                      ],
+                    ),
+                    child: Padding(
+                      padding: const EdgeInsets.all(24),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      'Kritik dan Saran',
+                                      style: theme.textTheme.titleLarge
+                                          ?.copyWith(
+                                            fontWeight: FontWeight.w800,
+                                            letterSpacing: -0.3,
+                                          ),
+                                    ),
+                                    const SizedBox(height: 4),
+                                    Text(
+                                      'Bantu AskCore jadi lebih enak dipakai.',
+                                      style: theme.textTheme.bodySmall
+                                          ?.copyWith(
+                                            color: theme
+                                                .colorScheme
+                                                .onSurfaceVariant,
+                                            fontWeight: FontWeight.w500,
+                                          ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              IconButton(
+                                onPressed: _isSubmittingFeedback
+                                    ? null
+                                    : () => Navigator.of(dialogContext).pop(),
+                                icon: const Icon(Icons.close_rounded, size: 20),
+                                tooltip: 'Tutup',
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 22),
+                          TextField(
+                            controller: controller,
+                            autofocus: true,
+                            minLines: 5,
+                            maxLines: 7,
+                            maxLength: 2000,
+                            textInputAction: TextInputAction.newline,
+                            style: theme.textTheme.bodyMedium?.copyWith(
+                              height: 1.45,
+                              fontWeight: FontWeight.w500,
+                            ),
+                            decoration: InputDecoration(
+                              hintText:
+                                  'Tulis kritik, saran, bug, atau ide fitur di sini...',
+                              alignLabelWithHint: true,
+                              filled: true,
+                              fillColor: fieldColor,
+                              contentPadding: const EdgeInsets.fromLTRB(
+                                18,
+                                18,
+                                18,
+                                12,
+                              ),
+                              border: OutlineInputBorder(
+                                borderRadius: BorderRadius.circular(22),
+                                borderSide: BorderSide(color: outlineColor),
+                              ),
+                              enabledBorder: OutlineInputBorder(
+                                borderRadius: BorderRadius.circular(22),
+                                borderSide: BorderSide(color: outlineColor),
+                              ),
+                              focusedBorder: OutlineInputBorder(
+                                borderRadius: BorderRadius.circular(22),
+                                borderSide: BorderSide(
+                                  color: theme.colorScheme.primary,
+                                  width: 1.6,
+                                ),
+                              ),
+                              counterStyle: theme.textTheme.bodySmall?.copyWith(
+                                color: theme.colorScheme.onSurfaceVariant,
+                              ),
+                            ),
+                            onChanged: (value) {
+                              final nextCanSubmit = value.trim().isNotEmpty;
+                              if (nextCanSubmit != canSubmit) {
+                                setDialogState(() => canSubmit = nextCanSubmit);
+                              }
+                            },
+                          ),
+                          const SizedBox(height: 10),
+                          Row(
+                            children: [
+                              Expanded(
+                                child: Text(
+                                  'Masukan kamu akan tersimpan bersama chat aktif jika ada.',
+                                  style: theme.textTheme.bodySmall?.copyWith(
+                                    color: theme.colorScheme.onSurfaceVariant,
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 12),
+                              TextButton(
+                                onPressed: _isSubmittingFeedback
+                                    ? null
+                                    : () => Navigator.of(dialogContext).pop(),
+                                child: const Text('Batal'),
+                              ),
+                              const SizedBox(width: 8),
+                              FilledButton.icon(
+                                onPressed: canSubmit && !_isSubmittingFeedback
+                                    ? submit
+                                    : null,
+                                style: FilledButton.styleFrom(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 18,
+                                    vertical: 14,
+                                  ),
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(16),
+                                  ),
+                                ),
+                                icon: _isSubmittingFeedback
+                                    ? SizedBox(
+                                        width: 16,
+                                        height: 16,
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 2,
+                                          color: theme.colorScheme.onPrimary,
+                                        ),
+                                      )
+                                    : const Icon(Icons.send_rounded, size: 18),
+                                label: Text(
+                                  _isSubmittingFeedback
+                                      ? 'Mengirim...'
+                                      : 'Kirim',
+                                ),
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              );
+            },
+          );
+        },
+      );
+    } finally {
+      controller.dispose();
+      if (mounted && _isSubmittingFeedback) {
+        setState(() => _isSubmittingFeedback = false);
+      }
+    }
+  }
+
+  MessageAttachment _attachmentFromPending(PendingFile file) {
+    return MessageAttachment(
+      url: file.url,
+      name: file.name,
+      contentType: file.contentType,
+      sizeBytes: file.sizeBytes,
+      previewBytes: file.previewBytes,
+    );
+  }
+
+  ArtifactSummary? _artifactFromApi(Map<String, dynamic> message) {
+    final raw = message['artifact'];
+    if (raw is Map) {
+      return ArtifactSummary.fromJson(Map<String, dynamic>.from(raw));
+    }
+    return null;
+  }
+
+  Future<void> _loadChatArtifacts(int chatId) async {
+    try {
+      final artifacts = await _api.getChatArtifacts(chatId);
+      if (!mounted) return;
+      setState(() => _artifacts = artifacts);
+    } catch (_) {}
+  }
+
+  Future<void> _openArtifact(String artifactId) async {
+    try {
+      final artifact = await _api.getArtifact(artifactId);
+      if (!mounted) return;
+      final isMobile =
+          MediaQuery.sizeOf(context).width < AppConstants.sidebarBreakpoint;
+      if (isMobile) {
+        await Navigator.of(context).push(
+          MaterialPageRoute(
+            builder: (_) => Scaffold(
+              body: SafeArea(
+                child: ArtifactViewer(
+                  artifact: artifact,
+                  onClose: () => Navigator.of(context).pop(),
+                ),
+              ),
+            ),
+          ),
+        );
+        return;
+      }
+      setState(() {
+        _activeArtifact = artifact;
+        _artifactPanelOpen = true;
+        if (!_artifacts.any((item) => item.id == artifact.id)) {
+          _artifacts = [artifact, ..._artifacts];
+        }
+      });
+    } catch (e) {
+      _showErrorSnack('Gagal membuka artifact: $e');
+    }
+  }
+
+  void _closeArtifactPanel() {
+    setState(() => _artifactPanelOpen = false);
+  }
+
+  List<MessageAttachment> _attachmentsFromApi(Map<String, dynamic> message) {
+    final rawUrls = message['file_urls'];
+    final rawNames = message['file_names'];
+    final urls = rawUrls is List
+        ? rawUrls.map((value) => value.toString()).toList()
+        : <String>[
+            if ((message['file_url']?.toString() ?? '').isNotEmpty)
+              message['file_url'].toString(),
+          ];
+    final names = rawNames is List
+        ? rawNames.map((value) => value.toString()).toList()
+        : <String>[
+            if ((message['file_name']?.toString() ?? '').isNotEmpty)
+              message['file_name'].toString(),
+          ];
+
+    final attachments = <MessageAttachment>[];
+    for (var i = 0; i < urls.length; i++) {
+      final url = urls[i];
+      final name = i < names.length ? names[i] : 'Lampiran ${i + 1}';
+      if (url.isEmpty || name.isEmpty) continue;
+      attachments.add(MessageAttachment(url: url, name: name));
+    }
+    return attachments;
+  }
+
+  bool _looksLikeImageRequest(String text, List<PendingFile> files) {
+    final lower = text.toLowerCase();
+    final createVerb = RegExp(
+      r'\b(buat|buatkan|bikin|generate|desain|draw|create)\b',
+      caseSensitive: false,
+    ).hasMatch(lower);
+    final imageNoun = RegExp(
+      r'\b(gambar|image|foto|poster|ilustrasi|logo)\b',
+      caseSensitive: false,
+    ).hasMatch(lower);
+    final editVerb = RegExp(
+      r'\b(edit|ubah|ganti|replace|jadikan|pakai|baju|warna|background|hapus|tambahkan)\b',
+      caseSensitive: false,
+    ).hasMatch(lower);
+    return (createVerb && imageNoun) ||
+        (files.any((file) => file.isImage) && editVerb);
   }
 
   Future<void> _onImagePasted(Uint8List bytes, String mimeType) async {
-    if (_pendingFiles.length >= 5) return;
+    if (_isLoading) return;
+
+    if (_pendingFiles.length >= ChatInput.maxFiles) {
+      _showErrorSnack('Maksimal ${ChatInput.maxFiles} file per pesan');
+      return;
+    }
+
+    if (bytes.length > AppConstants.maxFileSize) {
+      _showErrorSnack('Gambar terlalu besar (maks 1MB)');
+      return;
+    }
+
+    // Pasted images can be analyzed by vision models or auto-routed by the
+    // backend to Qwen Image Edit when the prompt is an edit/generation request.
     final ext = mimeType.split('/').last;
     final fileName = 'pasted_${DateTime.now().millisecondsSinceEpoch}.$ext';
+
+    setState(() {
+      _pendingFiles.add(
+        PendingFile(
+          url: '',
+          name: fileName,
+          previewBytes: bytes,
+          contentType: mimeType,
+          sizeBytes: bytes.length,
+        ),
+      );
+    });
+
     try {
       final result = await _api.uploadFile(bytes, fileName, mimeType);
-      if (mounted) {
-        setState(() {
-          _pendingFiles.add(
-            PendingFile(
-              url: result['key'] ?? '',
-              name: result['file_name'] ?? fileName,
-            ),
-          );
-        });
-      }
-    } catch (_) {}
+      if (!mounted) return;
+
+      final uploadedFile = PendingFile(
+        url: result['key'] ?? result['url'] ?? '',
+        name: result['file_name'] ?? result['name'] ?? fileName,
+        previewBytes: bytes,
+        contentType: mimeType,
+        sizeBytes: bytes.length,
+      );
+
+      setState(() {
+        final index = _pendingFiles.indexWhere(
+          (file) => file.name == fileName && file.url.isEmpty,
+        );
+        if (index != -1) {
+          _pendingFiles[index] = uploadedFile;
+        }
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _pendingFiles.removeWhere(
+          (file) => file.name == fileName && file.url.isEmpty,
+        );
+      });
+      _showErrorSnack('Upload gambar gagal: $e');
+    }
   }
 
   @override
@@ -137,6 +627,7 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
     for (final c in _animControllers.values) {
       c.dispose();
     }
+    _streamingText.dispose();
     super.dispose();
   }
 
@@ -153,6 +644,7 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
     try {
       final msgs = await _api.getMessages(chatId);
       if (mounted) {
+        await _loadChatArtifacts(chatId);
         setState(() {
           _messages = msgs
               .map(
@@ -165,6 +657,8 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
                   timestamp:
                       DateTime.tryParse(m['created_at'] ?? '') ??
                       DateTime.now(),
+                  attachments: _attachmentsFromApi(m),
+                  artifact: _artifactFromApi(m),
                 ),
               )
               .toList();
@@ -202,8 +696,47 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
     });
   }
 
+  /// Pin the view to the newest streamed content, but only when the user is
+  /// already near the bottom so manual scrolling is never hijacked.
+  void _followStream() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!_scrollController.hasClients) return;
+      final position = _scrollController.position;
+      if (position.maxScrollExtent - position.pixels < 160) {
+        _scrollController.jumpTo(position.maxScrollExtent);
+      }
+    });
+  }
+
+  String _baseReasoningModel(String model) {
+    for (final entry in _reasoningModelPairs.entries) {
+      if (entry.value == model) return entry.key;
+    }
+    return model;
+  }
+
+  String? _thinkingModelFor(String model) {
+    return _reasoningModelPairs[_baseReasoningModel(model)];
+  }
+
+  bool _isThinkingModel(String model) {
+    return _reasoningModelPairs.values.contains(model);
+  }
+
+  bool _supportsReasoningModel(String model) {
+    final base = _baseReasoningModel(model);
+    final thinking = _thinkingModelFor(model);
+    if (thinking == null) return false;
+    return _models.any((m) => m.id == base) &&
+        _models.any((m) => m.id == thinking);
+  }
+
   Future<void> _selectChat(int chatId) async {
-    setState(() => _selectedChatId = chatId);
+    setState(() {
+      _selectedChatId = chatId;
+      _artifactPanelOpen = false;
+      _activeArtifact = null;
+    });
     await _loadMessages(chatId);
 
     // Sync reasoning toggle based on loaded model
@@ -211,7 +744,7 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
     final model = chat['model'] as String? ?? _currentModel;
     setState(() {
       _currentModel = model;
-      _reasoningEnabled = model == 'mk/sonnet-4.5-thinking';
+      _reasoningEnabled = _isThinkingModel(model);
       if (_reasoningEnabled) {
         _activeTools.add(ChatTool.reasoning);
       } else {
@@ -246,22 +779,36 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
         setState(() {
           _selectedChatId = null;
           _messages.clear();
+          _artifacts = [];
+          _activeArtifact = null;
+          _artifactPanelOpen = false;
         });
       }
       await _loadChats();
     } catch (_) {}
   }
 
-  void _retryLastMessage() {
-    final payload = _lastRetryPayload;
+  void _retryMessage(String messageId) {
+    final payload = _retryPayloads[messageId] ?? _lastRetryPayload;
     if (payload == null || _isLoading) return;
 
     setState(() {
-      if (_messages.isNotEmpty && _messages.last.isError) {
-        _messages.removeLast();
-      }
-      if (_messages.isNotEmpty && _messages.last.role == MessageRole.user) {
-        _messages.removeLast();
+      final errorIndex = _messages.indexWhere((m) => m.id == messageId);
+      if (errorIndex != -1) {
+        _messages.removeAt(errorIndex);
+        if (errorIndex > 0 &&
+            _messages[errorIndex - 1].role == MessageRole.user) {
+          _messages.removeAt(errorIndex - 1);
+        }
+        _retryPayloads.remove(messageId);
+      } else {
+        if (_messages.isNotEmpty && _messages.last.isError) {
+          _retryPayloads.remove(_messages.last.id);
+          _messages.removeLast();
+        }
+        if (_messages.isNotEmpty && _messages.last.role == MessageRole.user) {
+          _messages.removeLast();
+        }
       }
     });
 
@@ -269,6 +816,8 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
   }
 
   void _handleReasoningToggle(bool enabled) {
+    String? modelToPersist;
+
     setState(() {
       _reasoningEnabled = enabled;
       if (enabled) {
@@ -277,17 +826,17 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
         _activeTools.remove(ChatTool.reasoning);
       }
 
-      // Auto-switch between Sonnet base and thinking variants
-      if (_currentModel == 'mk/sonnet-4.5' ||
-          _currentModel == 'mk/sonnet-4.5-thinking') {
-        _currentModel = enabled ? 'mk/sonnet-4.5-thinking' : 'mk/sonnet-4.5';
-
-        // Persist to database
-        if (_selectedChatId != null) {
-          _api.updateChatModel(_selectedChatId!, _currentModel);
-        }
+      final baseModel = _baseReasoningModel(_currentModel);
+      final thinkingModel = _reasoningModelPairs[baseModel];
+      if (thinkingModel != null) {
+        _currentModel = enabled ? thinkingModel : baseModel;
+        modelToPersist = _currentModel;
       }
     });
+
+    if (_selectedChatId != null && modelToPersist != null) {
+      _api.updateChatModel(_selectedChatId!, modelToPersist!);
+    }
   }
 
   Future<void> _sendMessage(
@@ -310,41 +859,67 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
         retryPayload?.files ?? List<PendingFile>.from(_pendingFiles);
     final toolsForSend =
         retryPayload?.tools ?? Set<ChatTool>.from(_activeTools);
-    _lastRetryPayload = _RetryPayload(
+    if (retryPayload == null && _looksLikeImageRequest(content, filesForSend)) {
+      toolsForSend.add(ChatTool.createImage);
+    }
+    final retryDetails = _RetryPayload(
       content: content,
       files: filesForSend,
       tools: toolsForSend,
     );
-
-    String userContent = content;
-    if (filesForSend.isNotEmpty) {
-      final names = filesForSend.map((f) => '📎 ${f.name}').join('\n');
-      userContent += '\n\n$names';
-    }
+    _lastRetryPayload = retryDetails;
 
     // Clean up old animation controllers
     _cleanupAnimControllers();
 
-    final userMsg = ChatMessage.user(userContent);
+    final userMsg = ChatMessage.user(
+      content,
+      attachments: filesForSend.map(_attachmentFromPending).toList(),
+    );
     final userAnim = _createAnimController();
     _animControllers[userMsg.id] = userAnim;
 
-    final thinkingMsg = ChatMessage.thinking();
+    final isCreatingImage = toolsForSend.contains(ChatTool.createImage);
+    final isBrowsing = toolsForSend.contains(ChatTool.browseWeb);
+    final thinkingMsg = isCreatingImage
+        ? ChatMessage.imageLoading()
+        : isBrowsing
+        ? ChatMessage.browsing()
+        : ChatMessage.thinking();
     final thinkingAnim = _createAnimController();
     _animControllers[thinkingMsg.id] = thinkingAnim;
+    _retryPayloads[thinkingMsg.id] = retryDetails;
 
     setState(() {
       _messages.add(userMsg);
       _messages.add(thinkingMsg);
       _isLoading = true;
+      if (retryPayload == null) {
+        _pendingFiles = [];
+      }
     });
     _scrollToBottom();
 
     final toolsList = toolsForSend
         .where((tool) => tool != ChatTool.reasoning)
-        .map(
-          (tool) => tool == ChatTool.browseWeb ? 'browse_web' : 'create_image',
-        )
+        .map((tool) {
+          switch (tool) {
+            case ChatTool.browseWeb:
+              return 'browse_web';
+            case ChatTool.createImage:
+              return 'create_image';
+            case ChatTool.generatePdf:
+              return 'generate_pdf';
+            case ChatTool.generateDocx:
+              return 'generate_docx';
+            case ChatTool.generateTxt:
+              return 'generate_txt';
+            case ChatTool.generateCsv:
+              return 'generate_csv';
+            case ChatTool.reasoning:
+              return 'reasoning'; // Filtered out above, but included for exhaustiveness
+          }
+        })
         .toList();
     final pendingFilesCopy = List<PendingFile>.from(filesForSend);
 
@@ -352,8 +927,9 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
       String accumulated = '';
       bool firstToken = true;
       final idx = _messages.indexWhere((m) => m.id == thinkingMsg.id);
-      int tokenCount = 0;
-      const updateInterval = 3; // Update UI every 3 tokens to reduce lag
+      // Time-based throttle keeps rebuild cost flat regardless of token rate.
+      final updateThrottle = Stopwatch()..start();
+      const updateInterval = Duration(milliseconds: 85);
 
       await for (final event in _api.sendMessageStream(
         _selectedChatId!,
@@ -366,48 +942,76 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
         switch (event.type) {
           case SseEventType.token:
             accumulated += event.token ?? '';
-            tokenCount++;
 
-            // Only update UI every N tokens or on first token
+            // Stream renders as lightweight typing text (isTyping) so the
+            // expensive markdown parse runs once, on done. After the first
+            // setState, tokens flow through _streamingText and only the
+            // active bubble rebuilds — never the whole screen.
             if (firstToken && idx != -1) {
               firstToken = false;
-              setState(() {
-                _messages[idx] = ChatMessage(
-                  id: thinkingMsg.id,
-                  role: MessageRole.assistant,
-                  content: accumulated,
-                  timestamp: DateTime.now(),
-                  isLoading: false,
-                  isThinking: false,
-                  isTyping: false,
-                  revealedChars: accumulated.length,
-                );
-                _pendingFiles = [];
-              });
+              updateThrottle.reset();
+              _streamingText.value = accumulated;
+              // Update message in-place without triggering ListView rebuild
+              _messages[idx] = ChatMessage(
+                id: thinkingMsg.id,
+                role: MessageRole.assistant,
+                content: accumulated,
+                timestamp: DateTime.now(),
+                isLoading: false,
+                isThinking: false,
+                isTyping: true,
+                revealedChars: accumulated.length,
+              );
+              // Only setState for UI state that needs updating
+              if (mounted) {
+                setState(() {
+                  _streamingMessageId = thinkingMsg.id;
+                  if (retryPayload == null) {
+                    _pendingFiles = [];
+                  }
+                });
+              }
               _scrollToBottom();
-            } else if (idx != -1 && tokenCount >= updateInterval) {
-              tokenCount = 0; // Reset counter
-              setState(() {
-                _messages[idx] = _messages[idx].copyWith(
-                  content: accumulated,
-                  revealedChars: accumulated.length,
-                );
-              });
-              _scrollToBottom();
+            } else if (idx != -1 && updateThrottle.elapsed >= updateInterval) {
+              updateThrottle.reset();
+              _streamingText.value = accumulated;
+              _followStream();
             }
             break;
 
           case SseEventType.done:
+            final doneMessage = event.metadata?['message'];
+            final finalContent = doneMessage is Map
+                ? (doneMessage['content']?.toString() ?? accumulated)
+                : accumulated;
+            final artifact = event.metadata?['artifact'] is Map
+                ? ArtifactSummary.fromJson(
+                    Map<String, dynamic>.from(
+                      event.metadata!['artifact'] as Map,
+                    ),
+                  )
+                : null;
             if (idx != -1) {
               setState(() {
                 _messages[idx] = _messages[idx].copyWith(
-                  content: accumulated,
+                  content: finalContent,
                   isLoading: false,
+                  isImageLoading: false,
                   isTyping: false,
-                  revealedChars: accumulated.length,
+                  revealedChars: finalContent.length,
+                  artifact: artifact,
                 );
+                if (artifact != null &&
+                    !_artifacts.any((item) => item.id == artifact.id)) {
+                  _artifacts = [artifact, ..._artifacts];
+                }
+                _retryPayloads.remove(thinkingMsg.id);
+                _streamingMessageId = null;
                 _isLoading = false;
               });
+              if (artifact != null) {
+                await _openArtifact(artifact.id);
+              }
             }
             if (event.metadata?['chat_title_updated'] == true) {
               await _loadChats();
@@ -428,6 +1032,7 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
                   errorCode: event.code,
                   requestId: event.requestId,
                 );
+                _streamingMessageId = null;
                 _isLoading = false;
               });
             }
@@ -436,9 +1041,20 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
         }
       }
 
-      // Ensure loading is cleared
+      // Clear loading and finalize the message if the stream ended without a
+      // done event (connection drop) so it doesn't stay in typing mode.
       if (mounted) {
-        setState(() => _isLoading = false);
+        setState(() {
+          if (idx != -1 && idx < _messages.length && _messages[idx].isTyping) {
+            _messages[idx] = _messages[idx].copyWith(
+              content: accumulated,
+              isTyping: false,
+              revealedChars: accumulated.length,
+            );
+          }
+          _streamingMessageId = null;
+          _isLoading = false;
+        });
       }
     } catch (e) {
       final apiError = e is ApiException ? e : null;
@@ -456,6 +1072,7 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
       setState(() {
         final idx = _messages.indexWhere((m) => m.id == thinkingMsg.id);
         if (idx != -1) _messages[idx] = errMsg;
+        _streamingMessageId = null;
         _isLoading = false;
       });
       _showErrorSnack(apiError?.supportMessage ?? e.toString());
@@ -487,14 +1104,11 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
       } else {
         _activeTools.add(tool);
       }
-      // Auto-switch model for create_image
+      // Image tools are routed by the backend so normal chat model selection
+      // and conversation continuity stay intact.
       if (tool == ChatTool.createImage && _activeTools.contains(tool)) {
-        _currentModel = 'qc/qwen-image-2.0';
         _reasoningEnabled = false;
         _activeTools.remove(ChatTool.reasoning);
-        if (_selectedChatId != null) {
-          _api.updateChatModel(_selectedChatId!, _currentModel);
-        }
       }
     });
   }
@@ -568,8 +1182,10 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
                         horizontal: isDesktop ? 24 : 16,
                         vertical: 16,
                       ),
-                      // Performance: add cache extent
-                      cacheExtent: 500,
+                      // Performance: reduce cache extent for faster scrolling
+                      cacheExtent: 300,
+                      // Performance: don't keep offscreen items alive
+                      addAutomaticKeepAlives: false,
                       itemCount: _messages.length,
                       itemBuilder: (context, index) {
                         final msg = _messages[index];
@@ -577,9 +1193,16 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
                         // Wrap each message in RepaintBoundary to isolate repaints
                         return RepaintBoundary(
                           child: MessageBubble(
+                            key: ValueKey(msg.id),
                             message: msg,
                             animation: anim,
-                            onRetry: msg.isError ? _retryLastMessage : null,
+                            streamingText: msg.id == _streamingMessageId
+                                ? _streamingText
+                                : null,
+                            onRetry: msg.isError
+                                ? () => _retryMessage(msg.id)
+                                : null,
+                            onOpenArtifact: _openArtifact,
                           ),
                         );
                       },
@@ -604,9 +1227,7 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
                 onClearAllAttachments: _clearAllAttachments,
                 activeTools: _activeTools,
                 onToolToggled: _handleToolToggle,
-                supportsReasoning:
-                    _currentModel == 'mk/sonnet-4.5' ||
-                    _currentModel == 'mk/sonnet-4.5-thinking',
+                supportsReasoning: _supportsReasoningModel(_currentModel),
                 currentModelSupportsVision: _models
                     .firstWhere(
                       (m) => m.id == _currentModel,
@@ -656,16 +1277,62 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
         ],
       ),
       actions: [
+        const SizedBox(width: 24),
+        if (screenWidth >= 760) ...[
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            child: InkWell(
+              onTap: _isSubmittingFeedback ? null : _showFeedbackDialog,
+              borderRadius: BorderRadius.circular(12),
+              child: Opacity(
+                opacity: _isSubmittingFeedback ? 0.55 : 1,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 8,
+                  ),
+                  decoration: BoxDecoration(
+                    color: theme.colorScheme.surfaceContainerHighest.withValues(
+                      alpha: 0.5,
+                    ),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(
+                      color: theme.colorScheme.outline.withValues(alpha: 0.3),
+                    ),
+                  ),
+                  child: Text(
+                    'Kritik dan Saran',
+                    textAlign: TextAlign.center,
+                    style: theme.textTheme.labelMedium?.copyWith(
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+        ] else ...[
+          IconButton(
+            onPressed: _isSubmittingFeedback ? null : _showFeedbackDialog,
+            icon: const Icon(Icons.feedback_outlined, size: 20),
+            tooltip: 'Kritik dan Saran',
+          ),
+          const SizedBox(width: 4),
+        ],
         Padding(
           padding: const EdgeInsets.symmetric(vertical: 8),
           child: ModelSelector(
             currentModel: _currentModel,
             models: _models,
             onModelChanged: (model) {
+              final nextModel = _reasoningEnabled
+                  ? (_thinkingModelFor(model) ?? model)
+                  : _baseReasoningModel(model);
+
               setState(() {
-                _currentModel = model;
-                // Sync reasoning tool when model changes
-                _reasoningEnabled = model == 'mk/sonnet-4.5-thinking';
+                _currentModel = nextModel;
+                _reasoningEnabled = _isThinkingModel(nextModel);
                 if (_reasoningEnabled) {
                   _activeTools.add(ChatTool.reasoning);
                 } else {
@@ -674,7 +1341,7 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
               });
               // Persist model change to database for the active chat
               if (_selectedChatId != null) {
-                ApiService().updateChatModel(_selectedChatId!, model);
+                ApiService().updateChatModel(_selectedChatId!, nextModel);
               }
             },
           ),
@@ -683,16 +1350,22 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
         if (isDesktop) ...[
           const SizedBox(width: 4),
           IconButton(
-            onPressed: () => Navigator.of(
-              context,
-            ).push(MaterialPageRoute(builder: (_) => const PlaygroundScreen())),
+            onPressed: () async {
+              await playground.loadLibrary();
+              if (!context.mounted) return;
+              Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (_) => playground.PlaygroundScreen(),
+                ),
+              );
+            },
             icon: const Icon(Icons.code_rounded, size: 20),
             tooltip: 'Playground',
           ),
         ],
         const SizedBox(width: 4),
         IconButton(
-          onPressed: () => AskCoreApp.of(context)?.toggleTheme(),
+          onPressed: () => AskLoApp.of(context)?.toggleTheme(),
           icon: Icon(
             Theme.of(context).brightness == Brightness.dark
                 ? Icons.light_mode_rounded
@@ -701,6 +1374,15 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
           ),
           tooltip: 'Toggle theme',
         ),
+        // Admin panel button (only visible for admin users)
+        if (_api.isAdmin) ...[
+          const SizedBox(width: 4),
+          IconButton(
+            onPressed: () => Navigator.of(context).pushNamed('/admin'),
+            icon: const Icon(Icons.admin_panel_settings_rounded, size: 20),
+            tooltip: 'Admin Panel',
+          ),
+        ],
         const SizedBox(width: 4),
       ],
     );
@@ -743,6 +1425,31 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
                 Expanded(
                   child: Scaffold(appBar: appBar, body: chatBody),
                 ),
+                if (_artifactPanelOpen && _activeArtifact != null) ...[
+                  VerticalDivider(
+                    width: 1,
+                    color: theme.colorScheme.outline.withValues(alpha: 0.15),
+                  ),
+                  AnimatedContainer(
+                    duration: const Duration(milliseconds: 240),
+                    curve: Curves.easeOutCubic,
+                    width:
+                        (screenWidth < 980.0
+                            ? 980.0
+                            : screenWidth > 1440.0
+                            ? 1440.0
+                            : screenWidth) *
+                        0.38,
+                    constraints: const BoxConstraints(
+                      minWidth: 520,
+                      maxWidth: 680,
+                    ),
+                    child: ArtifactViewer(
+                      artifact: _activeArtifact!,
+                      onClose: _closeArtifactPanel,
+                    ),
+                  ),
+                ],
               ],
             ),
           ),
@@ -753,6 +1460,7 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
         appBar: appBar,
         drawer: Drawer(width: AppConstants.sidebarWidth, child: sidebar),
         body: chatBody,
+        resizeToAvoidBottomInset: true,
       );
     }
   }

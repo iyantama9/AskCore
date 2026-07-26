@@ -1,19 +1,142 @@
 const express = require('express');
 const { pool } = require('../db');
 const authMiddleware = require('../middleware/auth');
-const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { uploadFile, getPublicUrl } = require('../utils/minio');
 const { validatePublicHttpUrl } = require('../utils/urlSafety');
 const { assertCanReadR2Key, recordFile } = require('../utils/files');
 const { sendError } = require('../utils/errors');
 const { assertQuota, recordUsage } = require('../utils/usage');
 const { assertValidModel } = require('../utils/modelCatalog');
+const {
+  artifactSummary,
+  buildArtifactForResponse,
+  summarizeArtifact,
+} = require('../utils/artifactExtraction');
+const { extractAttachment, formatDocumentContext } = require('../utils/documentAnalysis');
 const logger = require('../utils/logger');
 const metrics = require('../utils/metrics');
+const { v4: uuidv4 } = require('uuid');
 
 const router = express.Router();
 router.use(authMiddleware);
 
 const TITLE_MODEL = 'qc/qwen-flash';
+const DEFAULT_TEXT_MODEL = 'mk/haiku-4.5';
+const IMAGE_GENERATION_MODELS = [
+  'qc/qwen-image-2.0',
+  'qc/qwen-image-2.0-pro',
+  'qc/qwen-image-2.0-2026-03-03',
+  'qc/qwen-image-2.0-pro-2026-06-22',
+  'qc/qwen-image-2.0-pro-2026-04-22',
+  'qc/qwen-image-2.0-pro-2026-03-03',
+  'qc/qwen-image-max',
+  'qc/qwen-image-max-2025-12-30',
+  'qc/qwen-image-plus',
+  'qc/qwen-image-plus-2026-01-09',
+  'qc/wan2.7-image-pro',
+  'qc/wan2.7-image',
+  'qc/z-image-turbo',
+];
+const IMAGE_EDIT_MODELS = [
+  'qc/qwen-image-edit',
+  'qc/qwen-image-edit-plus',
+  'qc/qwen-image-edit-plus-2025-12-15',
+  'qc/qwen-image-edit-plus-2025-10-30',
+  'qc/qwen-image-edit-max',
+  'qc/qwen-image-edit-max-2026-01-16',
+];
+
+function needsRealtimeInfo(text = '') {
+  if (!text) return false;
+
+  const realtimeKeywords = [
+    // Time-sensitive
+    /\b(terbaru|sekarang|saat ini|hari ini|minggu ini|bulan ini|tahun ini|2026|update|current|latest)\b/i,
+    // Price/shopping queries
+    /\b(harga|berapa|beli|jual|toko|marketplace|shopee|tokopedia|price|cost)\b/i,
+    // Product/spec queries
+    /\b(spesifikasi|spec|review|perbandingan|vs|compare|mana yang lebih baik)\b/i,
+    // News/info queries
+    /\b(berita|news|informasi|info|data|statistik|cari|carikan|find)\b/i,
+    // Location/availability
+    /\b(di mana|dimana|tersedia|available|lokasi|location)\b/i,
+  ];
+
+  return realtimeKeywords.some(pattern => pattern.test(text));
+}
+
+function wantsImageGeneration(text = '') {
+  return /\b(buat|buatkan|bikin|generate|desain|draw|create)\b/i.test(text) &&
+    /\b(gambar|image|foto|poster|ilustrasi|logo)\b/i.test(text);
+}
+
+function wantsImageEdit(text = '', urls = []) {
+  return urls.length > 0 && /\b(edit|ubah|ganti|replace|jadikan|pakai|baju|warna|background|hapus|tambahkan)\b/i.test(text);
+}
+
+function isImageFileName(fileName = '') {
+  const ext = fileName.split('.').pop()?.toLowerCase() || '';
+  return ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'].includes(ext);
+}
+
+async function createArtifact({ ownerId, chatId, messageId, artifact }) {
+  if (!artifact || !Array.isArray(artifact.files) || artifact.files.length === 0) return null;
+
+  // Generate PDF/DOCX if needed
+  if (artifact.needsGeneration && (artifact.targetFormat === 'pdf' || artifact.targetFormat === 'docx')) {
+    const { generatePDF, generateDOCX } = require('../utils/documentGeneration');
+    const file = artifact.files[0];
+    const content = file.content;
+    const title = artifact.title.replace(/\.(pdf|docx)$/, '');
+
+    try {
+      let buffer;
+      if (artifact.targetFormat === 'pdf') {
+        buffer = await generatePDF(content, title);
+      } else if (artifact.targetFormat === 'docx') {
+        buffer = await generateDOCX(content, title);
+      }
+
+      // Upload to MinIO
+      const fileName = `artifacts/${ownerId}/${uuidv4()}.${artifact.targetFormat}`;
+      await uploadFile(fileName, buffer, file.mime_type);
+      const publicUrl = getPublicUrl(fileName);
+
+      // Update file with URL and binary marker
+      file.url = publicUrl;
+      file.content = ''; // Don't store binary in DB
+      file.size = buffer.length;
+      file.is_binary = true;
+    } catch (err) {
+      logger.error('artifact_generation_failed', { error: err.message, format: artifact.targetFormat });
+      // Fall back to text content
+    }
+  }
+
+  const result = await pool.query(
+    `INSERT INTO artifacts (owner_id, chat_id, message_id, title, kind, files)
+     VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+     RETURNING *`,
+    [ownerId, chatId, messageId, artifact.title, artifact.kind, JSON.stringify(artifact.files)]
+  );
+  return result.rows[0];
+}
+
+function selectEffectiveModel({ chatModel, tools = [], content = '', urls = [], names = [] }) {
+  const attachedImages = urls.filter((_, index) => isImageFileName(names[index] || ''));
+  if (tools.includes('create_image') || wantsImageEdit(content, attachedImages) || wantsImageGeneration(content)) {
+    return attachedImages.length > 0 && wantsImageEdit(content, attachedImages)
+      ? IMAGE_EDIT_MODELS[0]
+      : IMAGE_GENERATION_MODELS[0];
+  }
+  return chatModel || DEFAULT_TEXT_MODEL;
+}
+
+function getImageFallbackModels(model) {
+  if (IMAGE_EDIT_MODELS.includes(model)) return IMAGE_EDIT_MODELS;
+  if (IMAGE_GENERATION_MODELS.includes(model)) return IMAGE_GENERATION_MODELS;
+  return [];
+}
 
 function toAnthropicContent(content) {
   if (!Array.isArray(content)) return content;
@@ -127,17 +250,6 @@ async function fetchAI({ model, messages, stream = false, max_tokens = 4096 }) {
     headers: { 'Content-Type': 'application/json' },
   });
 }
-
-// S3/R2 singleton client
-const s3Client = new S3Client({
-  region: 'auto',
-  endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
-  credentials: {
-    accessKeyId: process.env.R2_ACCESS_KEY_ID,
-    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
-  },
-});
-
 // --- Browse helpers ---
 
 // Direct HTTP search via DuckDuckGo Lite (no Puppeteer = no CAPTCHA)
@@ -200,15 +312,23 @@ async function executeSearch(query) {
     }
 
     const top = results.slice(0, 10);
-    let text = `Hasil pencarian untuk "${query}":\n\n`;
-    top.forEach((r, i) => {
-      text += `${i + 1}. ${r.title}\n   URL: ${r.url}\n`;
-      if (r.snippet) text += `   ${r.snippet}\n`;
-      text += '\n';
-    });
+
+    // Format search results dengan struktur markdown yang rapi
+    let text = `## 🔍 Hasil Pencarian: "${query}"\n\n`;
 
     if (top.length === 0) {
-      text += '(Tidak ada hasil ditemukan)\n';
+      text += '> ⚠️ Tidak ada hasil ditemukan. Coba dengan kata kunci yang berbeda.\n';
+    } else {
+      text += `Ditemukan **${top.length} hasil** teratas:\n\n---\n\n`;
+
+      top.forEach((r, i) => {
+        text += `### ${i + 1}. ${r.title}\n\n`;
+        text += `🔗 **URL:** ${r.url}\n\n`;
+        if (r.snippet) {
+          text += `📝 ${r.snippet}\n\n`;
+        }
+        text += '---\n\n';
+      });
     }
 
     logger.info('browse_search_complete', { result_count: top.length });
@@ -349,9 +469,9 @@ async function executeBrowseCommand(cmd, req) {
     // Screenshot
     const screenshotBuffer = await page.screenshot({ type: 'jpeg', quality: 60 });
     const key = `browse/${req.userId}/${Date.now()}.jpg`;
-    await s3Client.send(new PutObjectCommand({
-      Bucket: process.env.R2_BUCKET_NAME, Key: key, Body: screenshotBuffer, ContentType: 'image/jpeg',
-    }));
+    await uploadFile(key, screenshotBuffer, 'image/jpeg', {
+      'Cache-Control': 'public, max-age=31536000, immutable'
+    });
 
     // Extract text
     const pageText = await page.evaluate(() => {
@@ -388,7 +508,24 @@ async function executeBrowseCommand(cmd, req) {
 // --- End browse helpers ---
 
 const getSystemPrompt = (model, tools = []) => {
-  let base = `Jawab dalam Bahasa Indonesia kecuali user meminta bahasa lain. Gunakan format markdown jika diperlukan. Jika user melampirkan file (gambar, PDF, kode, dll), isi file tersebut sudah diekstrak dan disertakan langsung di dalam pesan user. Kamu BISA membaca dan menganalisis konten file tersebut.
+  let base = `Jawab dalam Bahasa Indonesia kecuali user meminta bahasa lain. SELALU gunakan format markdown yang rapi dan terstruktur untuk semua jawaban.
+
+ATURAN FORMAT OUTPUT (WAJIB):
+- Gunakan heading (##, ###) untuk struktur jawaban
+- Gunakan tabel markdown untuk data terstruktur (harga, spesifikasi, perbandingan)
+- Gunakan emoji yang relevan untuk visual clarity (💰 harga, 🔍 pencarian, 📊 data, ⚙️ spesifikasi, 🎯 kesimpulan, dll)
+- Gunakan bullet points untuk list
+- Gunakan bold (**text**) untuk highlight informasi penting
+- Gunakan blockquote (>) untuk catatan atau highlight khusus
+- Pisahkan section dengan horizontal rule (---) jika perlu
+
+Jika user melampirkan file (gambar, PDF, kode, CSV, teks, dll), isi file tersebut sudah diekstrak secara terstruktur dan disertakan langsung di dalam pesan user. Kamu BISA membaca dan menganalisis konten file tersebut.
+
+ATURAN ANALISIS DOKUMEN:
+- Jika user bertanya tentang file terlampir, jawab berdasarkan bagian dokumen yang diekstrak.
+- Jika ekstraksi dipotong, jelaskan bahwa kesimpulan berdasarkan konten yang berhasil diekstrak.
+- Untuk CSV, gunakan nama kolom dan sample yang tersedia; jangan mengarang statistik jika seluruh data tidak tersedia.
+- Untuk file kode, pertahankan nama file, simbol, fungsi, class, dan baris kode setepat mungkin.
 
 FORMAT MATEMATIKA:
 - Tulis persamaan inline dengan delimiter LaTeX $...$.
@@ -401,6 +538,24 @@ FORMAT MATEMATIKA:
     base += ' Kamu memiliki kemampuan menghasilkan gambar. Jika user meminta gambar, langsung generate gambar sesuai permintaan tanpa menolak.';
   } else {
     base += ' Jika user meminta gambar, sarankan untuk mengganti ke model yang mendukung image generation seperti gemini-3-pro-image-preview.';
+  }
+
+  base += '\n\nJika user meminta file hasil kerja, simpan jawaban sebagai file/artifact bila formatnya panjang, banyak kode, atau memang diminta sebagai file ekspor.';
+
+  if (tools.includes('generate_pdf')) {
+    base += '\n\n🔴 PENTING - GENERATE PDF MODE 🔴\nUser meminta file PDF. JANGAN buat kode atau instruksi. Langsung tulis konten dokumen dalam format markdown yang akan dikonversi ke PDF.\n\nContoh BENAR:\n## Laporan Penjualan Q1 2026\n\n### Executive Summary\nPenjualan meningkat 25% dibanding kuartal sebelumnya...\n\n### Detail\n- Produk A: Rp 100 juta\n- Produk B: Rp 150 juta\n\nContoh SALAH:\n```python\nfrom fpdf import PDF\npdf.write("Laporan...")\n```\n\nTulis konten dokumen LANGSUNG, bukan kode untuk membuat dokumen.';
+  }
+
+  if (tools.includes('generate_docx')) {
+    base += '\n\n🔴 PENTING - GENERATE DOCX MODE 🔴\nUser meminta file Word (DOCX). JANGAN buat kode atau instruksi. Langsung tulis konten dokumen dalam format markdown yang akan dikonversi ke DOCX.\n\nTulis konten dokumen LANGSUNG dengan heading, paragraf, list, dan tabel. Sistem akan otomatis mengkonversi ke format DOCX profesional.';
+  }
+
+  if (tools.includes('generate_txt')) {
+    base += '\n\nPENTING: User meminta file teks plain. Buat konten yang bersih dan mudah dibaca dalam format teks biasa tanpa formatting khusus.';
+  }
+
+  if (tools.includes('generate_csv')) {
+    base += '\n\nPENTING: User meminta data dalam format CSV. Buat data tabular dengan header kolom di baris pertama, diikuti dengan baris data. Gunakan koma sebagai separator. Contoh:\nNama,Usia,Kota\nJohn,25,Jakarta\nJane,30,Bandung';
   }
 
   if (tools.includes('browse_web')) {
@@ -446,12 +601,25 @@ router.get('/:chatId/messages', async (req, res) => {
     }
 
     const result = await pool.query(
-      `SELECT id, role, content, file_url, file_name, created_at
+      `SELECT id, role, content, file_url, file_name, file_urls, file_names, created_at
        FROM messages WHERE chat_id = $1
        ORDER BY created_at ASC`,
       [req.params.chatId]
     );
-    res.json(result.rows);
+
+    const artifacts = await pool.query(
+      `SELECT * FROM artifacts
+       WHERE chat_id = $1 AND owner_id = $2 AND message_id IS NOT NULL`,
+      [req.params.chatId, req.userId]
+    );
+    const artifactsByMessage = new Map(
+      artifacts.rows.map((row) => [String(row.message_id), artifactSummary(row)])
+    );
+
+    res.json(result.rows.map((row) => ({
+      ...row,
+      artifact: artifactsByMessage.get(String(row.id)) || null,
+    })));
   } catch (err) {
     return sendError(res, req, 500, 'Server error', err);
   }
@@ -506,21 +674,43 @@ router.post('/:chatId/messages', async (req, res) => {
       return sendError(res, req, 404, 'Chat not found');
     }
 
-    const model = chat.rows[0].model;
-    const modelInfo = assertValidModel(model);
+    const chatModel = chat.rows[0].model;
+    await assertValidModel(chatModel);
+
+    // Auto-enable browsing for real-time queries
+    let effectiveTools = tools || [];
+    if (!effectiveTools.includes('browse_web') && needsRealtimeInfo(content)) {
+      effectiveTools = [...effectiveTools, 'browse_web'];
+      logger.info('auto_enabled_browsing', {
+        request_id: req.requestId,
+        reason: 'real_time_query_detected'
+      });
+    }
+
+    let model = selectEffectiveModel({ chatModel, tools: effectiveTools, content, urls, names });
+    let modelInfo = await assertValidModel(model);
     await assertQuota(req.userId, 'ai_request', 1);
-    if (tools && tools.includes('browse_web')) {
+    if (effectiveTools.includes('browse_web')) {
       await assertQuota(req.userId, 'browse_request', 1);
     }
     if (modelInfo.supports_image_generation) {
       await assertQuota(req.userId, 'image_generation', 1);
+    } else if (tools && tools.includes('create_image')) {
+      await assertQuota(req.userId, 'image_generation', 1);
     }
 
-    // Save user message (store first file for backward compat in DB)
+    // Save user message (store first file for backward compat and all files for UI preview).
     await pool.query(
-      `INSERT INTO messages (chat_id, role, content, file_url, file_name)
-       VALUES ($1, 'user', $2, $3, $4)`,
-      [req.params.chatId, content, urls[0] || null, names[0] || null]
+      `INSERT INTO messages (chat_id, role, content, file_url, file_name, file_urls, file_names)
+       VALUES ($1, 'user', $2, $3, $4, $5::jsonb, $6::jsonb)`,
+      [
+        req.params.chatId,
+        content,
+        urls[0] || null,
+        names[0] || null,
+        JSON.stringify(urls),
+        JSON.stringify(names),
+      ]
     );
 
     // Get all messages for context
@@ -538,12 +728,10 @@ router.post('/:chatId/messages', async (req, res) => {
     // Helper: read file from R2 as buffer
     const readFileFromR2 = async (key) => {
       const safeKey = await assertCanReadR2Key(req.userId, key);
-      const obj = await s3Client.send(new GetObjectCommand({
-        Bucket: process.env.R2_BUCKET_NAME,
-        Key: safeKey,
-      }));
+      const { getFile } = require('../utils/minio');
+      const stream = await getFile(safeKey);
       const chunks = [];
-      for await (const chunk of obj.Body) chunks.push(chunk);
+      for await (const chunk of stream) chunks.push(chunk);
       return Buffer.concat(chunks);
     };
 
@@ -565,45 +753,21 @@ router.post('/:chatId/messages', async (req, res) => {
 
       const ext = fileName.split('.').pop()?.toLowerCase() || '';
       const imageExts = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'];
-      const textExts = [
-        'dart', 'js', 'ts', 'jsx', 'tsx', 'py', 'java', 'kt', 'swift',
-        'c', 'cpp', 'h', 'hpp', 'cs', 'go', 'rs', 'rb', 'php',
-        'html', 'css', 'scss', 'sass', 'less',
-        'json', 'yaml', 'yml', 'xml', 'toml', 'ini', 'env',
-        'sql', 'sh', 'bash', 'bat', 'ps1', 'cmd',
-        'md', 'txt', 'log', 'csv',
-        'vue', 'svelte', 'astro',
-        'r', 'lua', 'perl', 'scala', 'clj', 'ex', 'exs', 'erl',
-      ];
 
       try {
+        const buffer = await readFileFromR2(fileUrl);
         if (imageExts.includes(ext)) {
-          const buffer = await readFileFromR2(fileUrl);
           const base64 = buffer.toString('base64');
           const mimeMap = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp' };
           const mime = mimeMap[ext] || 'image/png';
           imageParts.push({ type: 'image_url', image_url: { url: `data:${mime};base64,${base64}` } });
           useMultimodal = true;
-        } else if (ext === 'pdf') {
-          const buffer = await readFileFromR2(fileUrl);
-          const pdfParse = require('pdf-parse');
-          const pdfData = await pdfParse(buffer);
-          const pdfText = pdfData.text?.substring(0, 15000) || '[PDF kosong]';
-          const lastMsg = allMessages[allMessages.length - 1];
-          if (lastMsg && lastMsg.role === 'user') {
-            lastMsg.content += `\n\n--- Isi dokumen PDF: ${fileName} (${pdfData.numpages} halaman) ---\n${pdfText}\n--- Akhir dokumen ---`;
-          }
-        } else if (textExts.includes(ext)) {
-          const buffer = await readFileFromR2(fileUrl);
-          const fileContent = buffer.toString('utf-8').substring(0, 15000);
-          const lastMsg = allMessages[allMessages.length - 1];
-          if (lastMsg && lastMsg.role === 'user') {
-            lastMsg.content += `\n\n--- File: ${fileName} ---\n${fileContent}\n--- End of file ---`;
-          }
         } else {
+          const extracted = await extractAttachment(buffer, fileName);
+          const context = formatDocumentContext(extracted, content);
           const lastMsg = allMessages[allMessages.length - 1];
           if (lastMsg && lastMsg.role === 'user') {
-            lastMsg.content += `\n\n[User melampirkan dokumen: ${fileName}. Analisis berdasarkan konteks percakapan.]`;
+            lastMsg.content += `\n\n${context}`;
           }
         }
       } catch (fileErr) {
@@ -633,12 +797,16 @@ router.post('/:chatId/messages', async (req, res) => {
       }
     }
 
+    const isImageRequest = modelInfo.supports_image_generation;
+    const imageTools = isImageRequest ? ['create_image'] : [];
     const messages = [
-      { role: 'system', content: getSystemPrompt(model, tools || []) },
+      { role: 'system', content: getSystemPrompt(model, [...effectiveTools, ...imageTools]) },
       ...allMessages,
     ];
 
-    const useStream = req.body.stream === true && (!tools || !tools.includes('browse_web'));
+    const useStream = req.body.stream === true &&
+      !effectiveTools.includes('browse_web') &&
+      !isImageRequest;
 
     // === SSE STREAMING MODE (non-browse only) ===
     if (useStream) {
@@ -690,11 +858,35 @@ router.post('/:chatId/messages', async (req, res) => {
         }
       }
 
+      let artifactRow = null;
+      let storedContent = fullContent;
+      const artifact = buildArtifactForResponse({ userPrompt: content, assistantContent: fullContent, tools });
+      if (artifact) {
+        storedContent = summarizeArtifact(artifact);
+      }
+
       // Save AI response to DB
       const saved = await pool.query(
         `INSERT INTO messages (chat_id, role, content) VALUES ($1, 'assistant', $2) RETURNING *`,
-        [req.params.chatId, fullContent]
+        [req.params.chatId, storedContent]
       );
+
+      if (artifact) {
+        try {
+          artifactRow = await createArtifact({
+            ownerId: req.userId,
+            chatId: req.params.chatId,
+            messageId: saved.rows[0].id,
+            artifact,
+          });
+        } catch (artifactErr) {
+          logger.warn('artifact_create_failed', {
+            request_id: req.requestId,
+            message_id: saved.rows[0].id,
+            error: artifactErr.message,
+          });
+        }
+      }
 
       // Auto-title on first message
       const msgCount = await pool.query(
@@ -725,17 +917,49 @@ router.post('/:chatId/messages', async (req, res) => {
       await recordUsage(req.userId, 'ai_request', 1, { model, stream: true });
 
       // Send final metadata
-      res.write(`data: ${JSON.stringify({ done: true, message: saved.rows[0], chat_title_updated: chatTitleUpdated })}\n\n`);
+      res.write(`data: ${JSON.stringify({
+        done: true,
+        message: saved.rows[0],
+        artifact: artifactRow ? artifactSummary(artifactRow) : null,
+        chat_title_updated: chatTitleUpdated,
+      })}\n\n`);
       res.write('data: [DONE]\n\n');
       return res.end();
     }
 
     // === NON-STREAMING MODE (browse + fallback) ===
-    const aiResponse = await fetchAI({ model, messages, stream: false });
+    let aiResponse = await fetchAI({ model, messages, stream: false });
 
     if (!aiResponse.ok) {
-      const errData = await aiResponse.json().catch(() => ({}));
-      throw new Error(errData.error?.message || 'AI API error');
+      const failoverModels = modelInfo.supports_image_generation
+        ? getImageFallbackModels(model)
+        : [];
+      let lastError = null;
+
+      for (const candidate of failoverModels.slice(1)) {
+        try {
+          const candidateInfo = await assertValidModel(candidate);
+          logger.warn('image_model_fallback_trying', {
+            request_id: req.requestId,
+            from_model: model,
+            to_model: candidate,
+            status: aiResponse.status,
+          });
+          model = candidate;
+          modelInfo = candidateInfo;
+          aiResponse = await fetchAI({ model, messages, stream: false });
+          if (aiResponse.ok) break;
+          const errData = await aiResponse.json().catch(() => ({}));
+          lastError = errData.error?.message || 'AI API error';
+        } catch (err) {
+          lastError = err.message || String(err);
+        }
+      }
+
+      if (!aiResponse.ok) {
+        const errData = await aiResponse.json().catch(() => ({}));
+        throw new Error(lastError || errData.error?.message || 'AI API error');
+      }
     }
 
     const aiData = await aiResponse.json();
@@ -743,7 +967,7 @@ router.post('/:chatId/messages', async (req, res) => {
     let aiContent = aiMsg?.content || '';
 
     // === AGENTIC BROWSING LOOP ===
-    if (tools && tools.includes('browse_web')) {
+    if (effectiveTools.includes('browse_web')) {
       const MAX_BROWSE_STEPS = 5;
       let browseMessages = [...messages];
       let currentResponse = aiContent;
@@ -818,36 +1042,50 @@ router.post('/:chatId/messages', async (req, res) => {
           }
         }
 
-        // Build browse context for AI
+        // Build browse context for AI with structured markdown
         const browseContext = browseResults.map((r, i) => {
-          let ctx = `--- Hasil (Step ${step + 1}, Command ${i + 1}) ---\n`;
-          if (r.error) return ctx + `Error: ${r.error}`;
+          if (r.error) {
+            return `### ❌ Command ${i + 1} - Error\n\n> ${r.error}\n\n---\n`;
+          }
 
-          // Search results (from HTTP fetch)
+          // Search results (from HTTP fetch) - already formatted
           if (r.type === 'search') {
-            ctx += r.text;
-            return ctx;
+            return r.text;
           }
 
-          // Browse results (from Puppeteer)
-          ctx += `URL: ${r.current_url || 'unknown'}\n`;
-          ctx += `Title: ${r.page_title || 'unknown'}\n`;
-          if (r.text_content) ctx += `Konten halaman:\n${r.text_content}\n`;
-          if (r.elements && r.elements.length > 0) {
-            ctx += `Elemen interaktif:\n`;
-            r.elements.forEach(el => {
-              if (el.type === 'link') ctx += `  - Link: "${el.text}" -> ${el.href}\n`;
-              if (el.type === 'input') ctx += `  - Input: ${el.name} (selector: ${el.selector})\n`;
-              if (el.type === 'button') ctx += `  - Button: "${el.text}"\n`;
-            });
+          // Browse results (from Puppeteer) - structured format
+          let ctx = `### 🌐 Browse Result ${i + 1}\n\n`;
+          ctx += `**URL:** ${r.current_url || 'unknown'}\n\n`;
+          ctx += `**Title:** ${r.page_title || 'unknown'}\n\n`;
+
+          if (r.text_content) {
+            ctx += `#### 📄 Konten Halaman:\n\n${r.text_content.substring(0, 2000)}\n\n`;
           }
-          if (r.screenshot_url) ctx += `Screenshot: ${r.screenshot_url}\n`;
+
+          if (r.elements && r.elements.length > 0) {
+            ctx += `#### 🔗 Elemen Interaktif:\n\n`;
+            r.elements.forEach(el => {
+              if (el.type === 'link') ctx += `- 🔗 Link: **"${el.text}"** → ${el.href}\n`;
+              if (el.type === 'input') ctx += `- 📝 Input: ${el.name} (selector: \`${el.selector}\`)\n`;
+              if (el.type === 'button') ctx += `- 🔘 Button: **"${el.text}"**\n`;
+            });
+            ctx += '\n';
+          }
+
+          if (r.screenshot_url) {
+            ctx += `📸 **Screenshot:** ${r.screenshot_url}\n\n`;
+          }
+
+          ctx += '---\n';
           return ctx;
         }).join('\n');
 
-        // Add AI response + browse result to conversation
+        // Add AI response + browse result to conversation with clear instruction
         browseMessages.push({ role: 'assistant', content: currentResponse });
-        browseMessages.push({ role: 'user', content: `[Hasil browsing otomatis - gunakan informasi ini untuk menjawab]\n\n${browseContext}` });
+        browseMessages.push({
+          role: 'user',
+          content: `[Hasil browsing otomatis telah diterima]\n\n${browseContext}\n\n**Instruksi:**\nJawab pertanyaan sebelumnya menggunakan informasi terkini dari hasil browsing di atas. Format jawaban dengan:\n- Struktur yang rapi (heading, tabel jika perlu)\n- Emoji yang relevan\n- Sertakan sumber URL yang kamu gunakan\n- Jika butuh informasi lebih detail dari URL tertentu, gunakan [BROWSE:url]`
+        });
 
         // Re-call AI with browse results
         const followUp = await fetchAI({
@@ -931,12 +1169,10 @@ router.post('/:chatId/messages', async (req, res) => {
           const ext = mimeType.split('/')[1] || 'png';
           const key = `generated/${req.userId}/${uuidv4()}.${ext}`;
 
-          await s3Client.send(new PutObjectCommand({
-            Bucket: process.env.R2_BUCKET_NAME,
-            Key: key,
-            Body: buffer,
-            ContentType: mimeType,
-          }));
+          await uploadFile(key, buffer, mimeType, {
+            'Cache-Control': 'public, max-age=31536000, immutable'
+          });
+
           await recordFile({
             ownerId: req.userId,
             key,
@@ -945,8 +1181,9 @@ router.post('/:chatId/messages', async (req, res) => {
             size: buffer.length,
             visibility: 'public',
           });
-          const baseUrl = process.env.PUBLIC_BASE_URL || 'https://askcore.dev';
-          contentParts.push(`![Generated Image](${baseUrl}/api/files/${key})`);
+
+          const publicUrl = getPublicUrl(key);
+          contentParts.push(`![Generated Image](${publicUrl})`);
         } catch (uploadErr) {
           metrics.inc('upload_failures_total', { code: 'GENERATED_IMAGE_SAVE_FAILED' });
           logger.warn('generated_image_save_failed', {
@@ -965,12 +1202,36 @@ router.post('/:chatId/messages', async (req, res) => {
     // Fallback if still empty
     if (!aiContent) aiContent = 'Maaf, tidak ada respons.';
 
+    let artifactRow = null;
+    let storedContent = aiContent;
+    const artifact = buildArtifactForResponse({ userPrompt: content, assistantContent: aiContent, tools });
+    if (artifact) {
+      storedContent = summarizeArtifact(artifact);
+    }
+
     // Save AI response
     const saved = await pool.query(
       `INSERT INTO messages (chat_id, role, content)
        VALUES ($1, 'assistant', $2) RETURNING *`,
-      [req.params.chatId, aiContent]
+      [req.params.chatId, storedContent]
     );
+
+    if (artifact) {
+      try {
+        artifactRow = await createArtifact({
+          ownerId: req.userId,
+          chatId: req.params.chatId,
+          messageId: saved.rows[0].id,
+          artifact,
+        });
+      } catch (artifactErr) {
+        logger.warn('artifact_create_failed', {
+          request_id: req.requestId,
+          message_id: saved.rows[0].id,
+          error: artifactErr.message,
+        });
+      }
+    }
 
     // Auto-generate title from first message
     const msgCount = history.rows.length;
@@ -1023,6 +1284,7 @@ router.post('/:chatId/messages', async (req, res) => {
 
     res.json({
       message: saved.rows[0],
+      artifact: artifactRow ? artifactSummary(artifactRow) : null,
       chat_title_updated: msgCount <= 1,
     });
   } catch (err) {
