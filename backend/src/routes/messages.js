@@ -551,11 +551,11 @@ FORMAT MATEMATIKA:
   }
 
   if (tools.includes('generate_txt')) {
-    base += '\n\nPENTING: User meminta file teks plain. Buat konten yang bersih dan mudah dibaca dalam format teks biasa tanpa formatting khusus.';
+    base += '\n\n🔴 PENTING - GENERATE TXT MODE 🔴\nUser meminta file teks plain. JANGAN buat kode atau instruksi. Langsung tulis konten teks yang diminta user.\n\nTulis konten teks LANGSUNG, bukan kode untuk membuat file teks.';
   }
 
   if (tools.includes('generate_csv')) {
-    base += '\n\nPENTING: User meminta data dalam format CSV. Buat data tabular dengan header kolom di baris pertama, diikuti dengan baris data. Gunakan koma sebagai separator. Contoh:\nNama,Usia,Kota\nJohn,25,Jakarta\nJane,30,Bandung';
+    base += '\n\n🔴 PENTING - GENERATE CSV MODE 🔴\nUser meminta data dalam format CSV. JANGAN buat kode atau instruksi. Langsung tulis data CSV.\n\nContoh BENAR:\nNama,Usia,Kota\nJohn,25,Jakarta\nJane,30,Bandung\n\nContoh SALAH:\n```python\nimport csv\nwriter.writerow([...])\n```\n\nTulis data CSV LANGSUNG dengan header di baris pertama, bukan kode untuk membuat CSV.';
   }
 
   if (tools.includes('browse_web')) {
