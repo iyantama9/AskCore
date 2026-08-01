@@ -29,11 +29,45 @@ ios/Flutter/Flutter.podspec
 # Backend
 backend/node_modules/
 backend/.env
+backend/.env.local
+backend/.env.production
+
+# Environment & secrets
+.env
+.env.*
+!.env.docker.example
+
+# Build artifacts & deploy packages
+*.apk
+*.tar.gz
+*.zip
+deploy_*.sh
+deploy_*.py
+setup_*.sh
+setup_*.py
+check_server.sh
+minio-fix.tar.gz
+Dockerfile.frontend
+docker-compose*.yml
+docker-deployment.tar.gz
+
+# Temp scripts & screenshots
+tmp_*
+askcore-*.png
+local-web-blank-check.png
+tmp_adacode/
+
+# Playwright MCP
+.playwright-mcp/
 
 # Misc
 .DS_Store
 *.log
 .agent/
 .gemini/
-# Added by code-review-graph
 .code-review-graph/
+.claude/
+.opencode.json
+.mcp.json
+devtools_options.yaml
+web/admin.html
