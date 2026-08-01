@@ -425,7 +425,10 @@ class _MessageBubbleState extends State<MessageBubble>
     }
     if (!_isSafeHttpUrl(uri)) return false;
     final host = uri.host.toLowerCase();
-    return host == 'askcore.dev' || host == 'www.askcore.dev';
+    return host == 'askcore.dev' ||
+        host == 'www.askcore.dev' ||
+        host == 'asklo.iyantama.tech' ||
+        host == 'www.asklo.iyantama.tech';
   }
 
   Future<void> _openSafeLink(String? href) async {
