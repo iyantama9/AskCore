@@ -40,7 +40,7 @@ class PlaygroundScreen extends StatelessWidget {
               ),
               const SizedBox(height: 8),
               Text(
-                'Playground dengan live preview hanya tersedia di versi web.\nBuka AskCore di browser untuk menggunakan fitur ini.',
+                'Playground dengan live preview hanya tersedia di versi web.\nBuka AskLo di browser untuk menggunakan fitur ini.',
                 textAlign: TextAlign.center,
                 style: theme.textTheme.bodyMedium?.copyWith(
                   color: theme.colorScheme.onSurfaceVariant,

@@ -204,7 +204,7 @@ class _MessageBubbleState extends State<MessageBubble>
                   ),
                 const SizedBox(width: 4),
                 Text(
-                  isUser ? 'You' : 'AskCore',
+                  isUser ? 'You' : 'AskLo',
                   style: theme.textTheme.labelSmall?.copyWith(
                     color: theme.colorScheme.onSurfaceVariant,
                     fontWeight: FontWeight.w600,
@@ -425,9 +425,7 @@ class _MessageBubbleState extends State<MessageBubble>
     }
     if (!_isSafeHttpUrl(uri)) return false;
     final host = uri.host.toLowerCase();
-    return host == 'askcore.dev' ||
-        host == 'www.askcore.dev' ||
-        host == 'asklo.iyantama.tech' ||
+    return host == 'asklo.iyantama.tech' ||
         host == 'www.asklo.iyantama.tech';
   }
 

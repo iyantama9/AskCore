@@ -1,8 +1,7 @@
-// ignore_for_file: avoid_web_libraries_in_flutter, deprecated_member_use
-
-import 'dart:html' as html;
 import 'dart:ui_web' as ui_web;
+
 import 'package:flutter/material.dart';
+import 'package:web/web.dart' as web;
 
 class PlaygroundScreen extends StatefulWidget {
   const PlaygroundScreen({super.key});
@@ -20,7 +19,7 @@ class _PlaygroundScreenState extends State<PlaygroundScreen>
   final _mdCtrl = TextEditingController(text: _defaultMd);
 
   late final String _viewType;
-  late final html.IFrameElement _iframe;
+  late final web.HTMLIFrameElement _iframe;
   int _activeTab = 0;
   bool _ready = false;
 
@@ -36,7 +35,7 @@ class _PlaygroundScreenState extends State<PlaygroundScreen>
 
   static const _defaultHtml = '''<div class="card">
   <div class="glow"></div>
-  <h1>Hello, AskCore! 👋</h1>
+  <h1>Hello, AskLo! 👋</h1>
   <p>Edit HTML, CSS & JS — lalu tekan <strong>▶ Run</strong></p>
   <button id="btn" onclick="">Click Me</button>
   <div id="output"></div>
@@ -141,7 +140,7 @@ btn.addEventListener('click', () => {
   setTimeout(() => btn.style.transform = '', 200);
 });''';
 
-  static const _defaultMd = '''# AskCore Markdown
+  static const _defaultMd = '''# AskLo Markdown
 
 ## Features
 - **Bold text** and *italic text*
@@ -161,7 +160,7 @@ function greet(name) {
 > "Code is poetry."
 
 ---
-*Made with ❤️ by AskCore*''';
+*Made with ❤️ by AskLo*''';
 
   @override
   void initState() {
@@ -177,12 +176,14 @@ function greet(name) {
 
   void _initIframe() {
     _viewType = 'pg-${DateTime.now().millisecondsSinceEpoch}';
-    _iframe = html.IFrameElement()
-      ..style.border = 'none'
-      ..style.width = '100%'
-      ..style.height = '100%'
-      ..allow = 'scripts'
-      ..setAttribute('sandbox', 'allow-scripts allow-same-origin');
+    final iframe =
+        web.document.createElement('iframe') as web.HTMLIFrameElement;
+    iframe.style.border = 'none';
+    iframe.style.width = '100%';
+    iframe.style.height = '100%';
+    iframe.allow = 'scripts';
+    iframe.setAttribute('sandbox', 'allow-scripts allow-same-origin');
+    _iframe = iframe;
 
     // ignore: undefined_prefixed_name
     ui_web.platformViewRegistry.registerViewFactory(
@@ -211,12 +212,11 @@ function greet(name) {
   }
 
   void _runWeb() {
-    _iframe.srcdoc =
-        '''<!DOCTYPE html>
+    _iframe.setAttribute('srcdoc', '''<!DOCTYPE html>
 <html><head><meta charset="UTF-8">
 <style>${_cssCtrl.text}</style></head>
 <body>${_htmlCtrl.text}
-<script>${_jsCtrl.text}</script></body></html>''';
+<script>${_jsCtrl.text}</script></body></html>''');
   }
 
   void _runMd() {
@@ -266,7 +266,7 @@ function greet(name) {
     });
     h = h.replaceAll('\n\n', '<br>');
 
-    _iframe.srcdoc = '''<!DOCTYPE html><html><head><meta charset="UTF-8">
+    _iframe.setAttribute('srcdoc', '''<!DOCTYPE html><html><head><meta charset="UTF-8">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:'Segoe UI',system-ui,sans-serif;background:#0a0a14;color:#e4e4ef;padding:2.5rem;line-height:1.7;max-width:760px;margin:0 auto}
@@ -283,7 +283,7 @@ a{color:#a78bfa;text-decoration:none}
 hr{border:none;border-top:1px solid #252538;margin:1.5rem 0}
 ul{padding-left:1.5rem}li{margin:0.3rem 0}
 strong{color:#fff}em{color:#a78bfa}
-</style></head><body>$h</body></html>''';
+</style></head><body>$h</body></html>''');
   }
 
   String _esc(String s) => s

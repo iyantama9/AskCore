@@ -10,7 +10,7 @@ const BASE_URL = (
   readArg('--base-url') ||
   process.env.SMOKE_BASE_URL ||
   process.env.PUBLIC_BASE_URL ||
-  'https://askcore.dev'
+  'https://asklo.iyantama.tech'
 ).replace(/\/$/, '');
 const USERNAME = process.env.SMOKE_USERNAME;
 const PASSWORD = process.env.SMOKE_PASSWORD;

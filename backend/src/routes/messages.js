@@ -493,7 +493,7 @@ async function executeBrowseCommand(cmd, req) {
     }).catch(() => []);
 
     return {
-      screenshot_url: `${process.env.PUBLIC_BASE_URL || 'https://askcore.dev'}/api/files/${key}`,
+      screenshot_url: `${process.env.PUBLIC_BASE_URL || 'https://asklo.iyantama.tech'}/api/files/${key}`,
       page_title: await page.title().catch(() => ''),
       current_url: page.url(),
       text_content: pageText,

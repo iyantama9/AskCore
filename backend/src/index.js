@@ -8,10 +8,18 @@ const chatRoutes = require('./routes/chats');
 const messageRoutes = require('./routes/messages');
 const uploadRoutes = require('./routes/upload');
 const fileRoutes = require('./routes/files');
+const artifactRoutes = require('./routes/artifacts');
 const browseRoutes = require('./routes/browse');
 const modelRoutes = require('./routes/models');
 const usageRoutes = require('./routes/usage');
+const feedbackRoutes = require('./routes/feedback');
 const authMiddleware = require('./middleware/auth');
+
+// Admin routes
+const adminModelsRoutes = require('./routes/admin/models');
+const adminRouterRoutes = require('./routes/admin/router');
+const adminPromotionsRoutes = require('./routes/admin/promotions');
+const adminUsersRoutes = require('./routes/admin/users');
 
 const rateLimit = require('express-rate-limit');
 const logger = require('./utils/logger');
@@ -34,13 +42,18 @@ const REQUIRED_ENV = [
   'JWT_SECRET',
   'AI_BASE_URL',
   'AI_API_KEY',
-  'R2_ACCOUNT_ID',
-  'R2_ACCESS_KEY_ID',
-  'R2_SECRET_ACCESS_KEY',
-  'R2_BUCKET_NAME',
+  'MINIO_ENDPOINT',
+  'MINIO_ACCESS_KEY',
+  'MINIO_SECRET_KEY',
+  'MINIO_BUCKET',
 ];
 
-const allowedOrigins = new Set(['https://askcore.dev', 'https://www.askcore.dev']);
+const allowedOrigins = new Set([
+  'https://asklo.iyantama.tech',
+  'https://www.asklo.iyantama.tech',
+  'https://asklo.iyantama.tech',
+  'https://www.asklo.iyantama.tech',
+]);
 
 if (!isProduction) {
   allowedOrigins.add('http://localhost:3000');
@@ -166,6 +179,9 @@ const aiLimiter = rateLimit({
     request_id: req.requestId,
   }),
 });
+// Public generated images/screenshots use their own cache headers and should
+// not compete with normal API rate limits.
+app.use('/api/files', fileRoutes);
 app.use(globalLimiter);
 
 // Routes
@@ -173,10 +189,17 @@ app.use('/api/auth', authLimiter, authRoutes);
 app.use('/api/chats', chatRoutes);
 app.use('/api/chats', aiLimiter, messageRoutes);
 app.use('/api/upload', uploadRoutes);
-app.use('/api/files', fileRoutes);
 app.use('/api/browse', browseRoutes);
 app.use('/api/models', modelRoutes);
 app.use('/api/usage', usageRoutes);
+app.use('/api/feedback', feedbackRoutes);
+app.use('/api', artifactRoutes);
+
+// Admin routes (protected by adminOnly middleware inside each route)
+app.use('/api/admin/models', adminModelsRoutes);
+app.use('/api/admin/router', adminRouterRoutes);
+app.use('/api/admin/promotions', adminPromotionsRoutes);
+app.use('/api/admin/users', adminUsersRoutes);
 
 app.use(notFoundHandler);
 app.use(errorHandler);

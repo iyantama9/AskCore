@@ -313,7 +313,7 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
                                     ),
                                     const SizedBox(height: 4),
                                     Text(
-                                      'Bantu AskCore jadi lebih enak dipakai.',
+                                      'Bantu AskLo jadi lebih enak dipakai.',
                                       style: theme.textTheme.bodySmall
                                           ?.copyWith(
                                             color: theme
